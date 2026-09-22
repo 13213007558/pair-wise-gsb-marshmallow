@@ -86,6 +86,15 @@ def _get_fields_by_mro(klass: SchemaMeta):
     )
 
 
+def _paths_overlap(path1: str, path2: str) -> bool:
+    """Return True if two dot-delimited internal field paths refer to the same
+    value or one is nested within the other.
+    """
+    return (
+        path1 == path2 or path1.startswith(path2 + ".") or path2.startswith(path1 + ".")
+    )
+
+
 class SchemaMeta(ABCMeta):
     """Metaclass for the Schema class. Binds the declared fields to
     a ``_declared_fields`` attribute, which is a dictionary mapping attribute
@@ -439,6 +448,9 @@ class Schema(metaclass=SchemaMeta):
         self.fields: dict[str, Field] = {}
         self.load_fields: dict[str, Field] = {}
         self.dump_fields: dict[str, Field] = {}
+        #: Dictionary mapping field_names -> :class:`Derived <marshmallow.fields.Derived>`
+        #: objects, in dependency order
+        self.derived_fields: dict[str, ma_fields.Derived] = {}
         self._init_fields()
         messages = {}
         messages.update(self._default_error_messages)
@@ -711,6 +723,9 @@ class Schema(metaclass=SchemaMeta):
         many: bool | None = None,
         partial: bool | types.StrSequenceOrSet | None = None,
         unknown: types.UnknownOption | None = None,
+        derived_baseline: (
+            Mapping[str, typing.Any] | Sequence[Mapping[str, typing.Any]] | None
+        ) = None,
     ):
         """Deserialize a data structure to an object defined by this Schema's fields.
 
@@ -724,15 +739,27 @@ class Schema(metaclass=SchemaMeta):
         :param unknown: Whether to exclude, include, or raise an error for unknown
             fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
             If `None`, the value for `self.unknown` is used.
+        :param derived_baseline: Already-deserialized baseline values used to
+            resolve dependencies of `Derived <marshmallow.fields.Derived>`
+            fields that are missing from `data` (e.g. during a partial load).
+            The baseline is only read from, never modified. If `many` is
+            `True`, this may be a sequence of mappings aligned with `data`.
         :return: Deserialized data
 
         .. versionchanged:: 3.0.0b7
             This method returns the deserialized data rather than a ``(data, errors)`` tuple.
             A :exc:`ValidationError <marshmallow.exceptions.ValidationError>` is raised
             if invalid data are passed.
+        .. versionadded:: 4.4.0
+            Add `derived_baseline` parameter.
         """
         return self._do_load(
-            data, many=many, partial=partial, unknown=unknown, postprocess=True
+            data,
+            many=many,
+            partial=partial,
+            unknown=unknown,
+            postprocess=True,
+            derived_baseline=derived_baseline,
         )
 
     def loads(
@@ -743,6 +770,9 @@ class Schema(metaclass=SchemaMeta):
         many: bool | None = None,
         partial: bool | types.StrSequenceOrSet | None = None,
         unknown: types.UnknownOption | None = None,
+        derived_baseline: (
+            Mapping[str, typing.Any] | Sequence[Mapping[str, typing.Any]] | None
+        ) = None,
         **kwargs,
     ):
         """Same as :meth:`load`, except it uses `marshmallow.Schema.Meta.render_module` to deserialize
@@ -766,9 +796,17 @@ class Schema(metaclass=SchemaMeta):
             if invalid data are passed.
         .. versionchanged:: 4.0.0
             Rename ``json_module`` parameter to ``s``.
+        .. versionadded:: 4.4.0
+            Add `derived_baseline` parameter.
         """
         data = self.opts.render_module.loads(s, **kwargs)
-        return self.load(data, many=many, partial=partial, unknown=unknown)
+        return self.load(
+            data,
+            many=many,
+            partial=partial,
+            unknown=unknown,
+            derived_baseline=derived_baseline,
+        )
 
     def _run_validator(
         self,
@@ -818,6 +856,9 @@ class Schema(metaclass=SchemaMeta):
         *,
         many: bool | None = None,
         partial: bool | types.StrSequenceOrSet | None = None,
+        derived_baseline: (
+            Mapping[str, typing.Any] | Sequence[Mapping[str, typing.Any]] | None
+        ) = None,
     ) -> dict[str, list[str]]:
         """Validate `data` against the schema, returning a dictionary of
         validation errors.
@@ -829,10 +870,19 @@ class Schema(metaclass=SchemaMeta):
             any fields declared. Propagates down to ``Nested`` fields as well. If
             its value is an iterable, only missing fields listed in that iterable
             will be ignored. Use dot delimiters to specify nested fields.
+        :param derived_baseline: Already-deserialized baseline values used to
+            resolve dependencies of `Derived <marshmallow.fields.Derived>`
+            fields that are missing from `data`. Only read from, never modified.
         :return: A dictionary of validation errors.
         """
         try:
-            self._do_load(data, many=many, partial=partial, postprocess=False)
+            self._do_load(
+                data,
+                many=many,
+                partial=partial,
+                postprocess=False,
+                derived_baseline=derived_baseline,
+            )
         except ValidationError as exc:
             return typing.cast("dict[str, list[str]]", exc.messages)
         return {}
@@ -847,6 +897,9 @@ class Schema(metaclass=SchemaMeta):
         partial: bool | types.StrSequenceOrSet | None = None,
         unknown: types.UnknownOption | None = None,
         postprocess: bool = True,
+        derived_baseline: (
+            Mapping[str, typing.Any] | Sequence[Mapping[str, typing.Any]] | None
+        ) = None,
     ):
         """Deserialize `data`, returning the deserialized result.
         This method is private API.
@@ -861,6 +914,11 @@ class Schema(metaclass=SchemaMeta):
         :param unknown: Whether to exclude, include, or raise an error for unknown
             fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
             If `None`, the value for `self.unknown` is used.
+        :param derived_baseline: Already-deserialized baseline values used to
+            resolve dependencies of `Derived <marshmallow.fields.Derived>`
+            fields that are missing from `data` (e.g. during a partial load).
+            The baseline is only read from, never modified. If `many` is
+            `True`, this may be a sequence of mappings aligned with `data`.
         :param postprocess: Whether to run post_load methods.
         :return: Deserialized data
         """
@@ -899,6 +957,16 @@ class Schema(metaclass=SchemaMeta):
             self._invoke_field_validators(
                 error_store=error_store, data=result, many=many
             )
+            # Compute derived fields now that all regular fields have been
+            # deserialized and validated, so that schema-level validators and
+            # post_load processors see the computed values.
+            if self.derived_fields:
+                self._compute_derived_fields(
+                    error_store=error_store,
+                    data=result,
+                    many=many,
+                    baseline=derived_baseline,
+                )
             # Run schema-level validation
             if self._hooks[VALIDATES_SCHEMA]:
                 field_errors = bool(error_store.errors)
@@ -1051,6 +1119,69 @@ class Schema(metaclass=SchemaMeta):
         self.fields = fields_dict
         self.dump_fields = dump_fields
         self.load_fields = load_fields
+        self.derived_fields = self._resolve_derived_fields()
+
+    def _resolve_derived_fields(self) -> dict[str, ma_fields.Derived]:
+        """Validate and order the derived fields declared on this schema.
+
+        Dependencies are declared as internal (attribute-side) paths and may
+        point to regular fields or to other derived fields. Unknown
+        dependency paths and dependency cycles are reported as `ValueError`
+        at bind time. The returned mapping preserves dependency order: a
+        derived field always appears after the derived fields it depends on,
+        while unrelated derived fields keep their declaration order.
+        This method is private API.
+        """
+        derived = {
+            name: field_obj
+            for name, field_obj in self.fields.items()
+            if isinstance(field_obj, ma_fields.Derived)
+        }
+        if not derived:
+            return {}
+
+        internal_keys = {
+            field_obj.attribute or name for name, field_obj in self.fields.items()
+        }
+        for name, field_obj in derived.items():
+            for path in field_obj.depends_on:
+                if not any(_paths_overlap(path, key) for key in internal_keys):
+                    raise ValueError(
+                        f'Derived field "{name}" depends on unknown '
+                        f'field path "{path}".'
+                    )
+
+        # Map each derived field's internal key back to its field name so
+        # that dependencies between derived fields can be ordered.
+        derived_by_key = {
+            field_obj.attribute or name: name for name, field_obj in derived.items()
+        }
+        ordered: list[str] = []
+        states: dict[str, str] = {}
+
+        def visit(name: str, trail: list[str]) -> None:
+            state = states.get(name)
+            if state == "done":
+                return
+            if state == "visiting":
+                cycle = [*trail[trail.index(name) :], name]
+                raise ValueError(
+                    "Cycle detected in derived field dependencies: "
+                    + " -> ".join(f'"{item}"' for item in cycle)
+                    + "."
+                )
+            states[name] = "visiting"
+            trail = [*trail, name]
+            for path in derived[name].depends_on:
+                for key, dep_name in derived_by_key.items():
+                    if _paths_overlap(path, key):
+                        visit(dep_name, trail)
+            states[name] = "done"
+            ordered.append(name)
+
+        for name in derived:
+            visit(name, [])
+        return {name: derived[name] for name in ordered}
 
     def on_bind_field(self, field_name: str, field_obj: Field) -> None:
         """Hook to modify a field when it is bound to the `Schema <marshmallow.Schema>`.
@@ -1170,6 +1301,80 @@ class Schema(metaclass=SchemaMeta):
                         )
                         if validated_value is missing:
                             data.pop(field_name, None)
+
+    def _compute_derived_fields(
+        self,
+        *,
+        error_store: ErrorStore,
+        data,
+        many: bool,
+        baseline: (
+            Mapping[str, typing.Any] | Sequence[Mapping[str, typing.Any]] | None
+        ) = None,
+    ) -> None:
+        """Compute the values of all derived fields, in dependency order.
+
+        Runs after regular field deserialization and field-level validation,
+        before schema-level validators and post_load processors. A derived
+        field is computed only when all of its declared dependencies are
+        available; otherwise it is skipped and omitted from the result.
+        This method is private API.
+        """
+        if many:
+            if not is_sequence_but_not_string(data):
+                return
+            baselines = list(baseline) if is_sequence_but_not_string(baseline) else None
+            for idx, item in enumerate(data):
+                if baselines is not None:
+                    item_baseline = baselines[idx] if idx < len(baselines) else None
+                else:
+                    item_baseline = baseline if isinstance(baseline, Mapping) else None
+                self._compute_derived_item(
+                    item,
+                    baseline=item_baseline,
+                    error_store=error_store,
+                    index=idx if self.opts.index_errors else None,
+                )
+        elif isinstance(data, Mapping):
+            self._compute_derived_item(
+                data,
+                baseline=baseline if isinstance(baseline, Mapping) else None,
+                error_store=error_store,
+                index=None,
+            )
+
+    def _compute_derived_item(
+        self,
+        item,
+        *,
+        baseline: Mapping[str, typing.Any] | None,
+        error_store: ErrorStore,
+        index: int | None,
+    ) -> None:
+        """Compute each derived field once for a single deserialized item.
+        This method is private API.
+        """
+        for name, field_obj in self.derived_fields.items():
+            values = {}
+            for path in field_obj.depends_on:
+                value = get_value(item, path, missing)
+                if value is missing and baseline is not None:
+                    # Fall back to the caller-provided baseline. The baseline
+                    # is only read from, never modified.
+                    value = get_value(baseline, path, missing)
+                if value is missing:
+                    break
+                values[path] = value
+            else:
+                data_key = (
+                    field_obj.data_key if field_obj.data_key is not None else name
+                )
+                try:
+                    computed = field_obj._compute(values)
+                except ValidationError as err:
+                    error_store.store_error(err.messages, data_key, index=index)
+                else:
+                    set_value(item, field_obj.attribute or name, computed)
 
     def _invoke_schema_validators(
         self,

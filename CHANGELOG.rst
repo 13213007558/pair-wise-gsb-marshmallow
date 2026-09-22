@@ -6,6 +6,12 @@ Changelog
 
 Features:
 
+- Add `Derived <marshmallow.fields.Derived>` field for declarative derived
+  values computed from other fields after deserialization and field-level
+  validation, before schema-level validators and ``post_load`` processors.
+  Dependencies are declared as internal field paths, may point to other
+  derived fields, and are resolved in dependency order at bind time.
+
 - Simplify `get_value` to match actual usage (:pr:`3024`).
 
 Bug fixes:

@@ -52,6 +52,7 @@ __all__ = [
     "Date",
     "DateTime",
     "Decimal",
+    "Derived",
     "Dict",
     "Email",
     "Enum",
@@ -2143,6 +2144,89 @@ class Constant(Field[_ContantT]):
 
     def _deserialize(self, value, *args, **kwargs) -> _ContantT:
         return self.constant
+
+
+class Derived(Field):
+    """A field whose value is computed from other fields during deserialization.
+
+    Derived fields are never deserialized from input data, so clients cannot
+    submit values for them. Instead, the schema computes their values after
+    all regular fields have been deserialized and field-level validators have
+    run, and before schema-level validators and ``post_load`` processors run.
+    This means schema-level validators and ``post_load`` processors always see
+    the computed values.
+
+    Each derived field declares the internal (attribute-side) paths it depends
+    on. A dependency may point to another derived field, in which case the
+    schema resolves the dependency graph and computes fields in dependency
+    order; derived fields that are unrelated to each other are computed in
+    declaration order. Each derived field is computed at most once per load.
+    Unknown dependency paths and dependency cycles raise a `ValueError`
+    when the schema is bound.
+
+    If any dependency is missing from the deserialized data -- for example
+    because its source field failed validation, or because it was omitted
+    during a partial load -- the derived field is skipped and omitted from the
+    result. Computations that do not depend on the missing value still run.
+    During partial loads, missing dependencies may be supplied explicitly via
+    the ``derived_baseline`` argument of `Schema.load <marshmallow.Schema.load>`;
+    ``load_default`` values of missing fields are never used to fill in
+    dependencies.
+
+    .. code-block:: python
+
+        class OrderSchema(Schema):
+            unit_price = fields.Decimal()
+            quantity = fields.Integer()
+            discount = fields.Decimal()
+            subtotal = fields.Derived(
+                depends_on=("unit_price", "quantity"),
+                compute=lambda values: values["unit_price"] * values["quantity"],
+            )
+            total = fields.Derived(
+                depends_on=("subtotal", "discount"),
+                compute=lambda values: values["subtotal"] * (1 - values["discount"]),
+            )
+
+    :param depends_on: Paths of the fields this field depends on, using
+        internal (attribute-side) names. Dotted paths may be used to reach
+        into nested structures.
+    :param compute: Callable that receives a mapping of dependency path to
+        resolved value and returns the computed value. It is only called when
+        every declared dependency is available, and at most once per load.
+    :param kwargs: The same keyword arguments as `Field <marshmallow.fields.Field>`,
+        except ``load_only`` and ``dump_only``. Derived fields are always
+        excluded from the load input and included in the dump output.
+
+    .. versionadded:: 4.4.0
+    """
+
+    def __init__(
+        self,
+        *,
+        depends_on: typing.Iterable[str],
+        compute: typing.Callable[[typing.Mapping[str, typing.Any]], typing.Any],
+        **kwargs: Unpack[_BaseFieldKwargs],
+    ):
+        if kwargs.get("load_only"):
+            raise ValueError("'load_only' must not be set for Derived fields.")
+        # Derived fields are computed during load, never deserialized from
+        # input, so they are always excluded from the load fields.
+        kwargs["dump_only"] = True
+        super().__init__(**kwargs)
+        self.depends_on = tuple(depends_on)
+        for path in self.depends_on:
+            if not isinstance(path, str):
+                raise TypeError(f"Dependency paths must be strings, got {path!r}.")
+        self.compute = utils.callable_or_raise(compute)
+
+    def _compute(self, values: typing.Mapping[str, typing.Any]) -> typing.Any:
+        """Compute the derived value from resolved dependency ``values`` and
+        validate it with this field's validators.
+        """
+        value = self.compute(values)
+        self._validate(value)
+        return value
 
 
 # Aliases
