@@ -6,6 +6,9 @@ Changelog
 
 Features:
 
+- Add ``load_aliases`` parameter to `Field <marshmallow.fields.Field>`
+  for accepting additional input keys during deserialization while
+  ``data_key`` remains the only key used during serialization.
 - Simplify `get_value` to match actual usage (:pr:`3024`).
 
 Bug fixes:

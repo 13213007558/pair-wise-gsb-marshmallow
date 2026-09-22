@@ -92,6 +92,7 @@ class _BaseFieldKwargs(typing.TypedDict, total=False):
     load_default: typing.Any
     dump_default: typing.Any
     data_key: str | None
+    load_aliases: typing.Iterable[str] | None
     attribute: str | None
     validate: types.Validator | typing.Iterable[types.Validator] | None
     pre_load: types.PreLoadCallable | typing.Iterable[types.PreLoadCallable] | None
@@ -130,6 +131,15 @@ class Field(typing.Generic[_InternalT]):
     :param data_key: The name of the dict key in the external representation, i.e.
         the input of `load` and the output of `dump`.
         If `None`, the key will match the name of the field.
+    :param load_aliases: Additional names of the dict key in the external
+        representation that are accepted during deserialization, e.g. to
+        support a renamed key from older clients. The primary input key
+        (``data_key`` or the field name) is always accepted and is the only
+        key used during serialization. Aliases are only consulted by
+        `load <marshmallow.Schema.load>`. Supplying both the primary key and
+        an alias in the same input data is an error.
+
+        .. versionadded:: 4.4.0
     :param attribute: The name of the key/attribute in the internal representation, i.e.
         the output of `load` and the input of `dump`.
         If `None`, the key/attribute will match the name of the field.
@@ -195,6 +205,7 @@ class Field(typing.Generic[_InternalT]):
         load_default: typing.Any = missing_,
         dump_default: typing.Any = missing_,
         data_key: str | None = None,
+        load_aliases: typing.Iterable[str] | None = None,
         attribute: str | None = None,
         validate: types.Validator | typing.Iterable[types.Validator] | None = None,
         pre_load: (
@@ -215,6 +226,18 @@ class Field(typing.Generic[_InternalT]):
 
         self.attribute = attribute
         self.data_key = data_key
+        if isinstance(load_aliases, str):
+            raise StringNotCollectionError(
+                '"load_aliases" should be a collection of strings'
+            )
+        self.load_aliases: tuple[str, ...] = (
+            tuple(load_aliases) if load_aliases is not None else ()
+        )
+        for alias in self.load_aliases:
+            if not isinstance(alias, str):
+                raise ValueError(
+                    f'"load_aliases" must be a collection of strings. Got {alias!r}.'
+                )
         self.validate = validate
         self.validators = self._normalize_processors(validate, param="validate")
         self.pre_load = self._normalize_processors(pre_load, param="pre_load")

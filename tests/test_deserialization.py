@@ -16,9 +16,12 @@ from marshmallow import (
     Schema,
     fields,
     missing,
+    post_load,
+    pre_load,
     validate,
+    validates,
 )
-from marshmallow.exceptions import ValidationError
+from marshmallow.exceptions import StringNotCollectionError, ValidationError
 from tests.base import (
     ALL_FIELDS,
     DateEnum,
@@ -2397,3 +2400,217 @@ def test_deserialize_raises_exception_if_input_type_is_incorrect(data, unknown):
     exc = excinfo.value
     assert isinstance(exc.messages, dict)
     assert list(exc.messages.keys()) == ["_schema"]
+
+
+class TestLoadAliases:
+    class CustomerSchema(Schema):
+        customer_id = fields.Int(data_key="customerId", load_aliases=("customer_id",))
+        name = fields.Str()
+
+    def test_load_accepts_primary_key(self):
+        result = self.CustomerSchema().load({"customerId": 1, "name": "Alice"})
+        assert result == {"customer_id": 1, "name": "Alice"}
+
+    def test_load_accepts_alias(self):
+        result = self.CustomerSchema().load({"customer_id": 1, "name": "Alice"})
+        assert result == {"customer_id": 1, "name": "Alice"}
+
+    def test_dump_only_uses_data_key(self):
+        result = self.CustomerSchema().dump({"customer_id": 1, "name": "Alice"})
+        assert result == {"customerId": 1, "name": "Alice"}
+
+    def test_load_alias_without_data_key(self):
+        class MySchema(Schema):
+            customer_id = fields.Int(load_aliases=["customerId"])
+
+        assert MySchema().load({"customerId": 1}) == {"customer_id": 1}
+        assert MySchema().load({"customer_id": 1}) == {"customer_id": 1}
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            {"customerId": 1, "customer_id": 1},
+            {"customerId": 1, "customer_id": 2},
+        ],
+    )
+    def test_primary_key_and_alias_is_ambiguous(self, data):
+        with pytest.raises(ValidationError) as excinfo:
+            self.CustomerSchema().load(data)
+        errors = excinfo.value.messages
+        assert "customerId" in errors
+        message = errors["customerId"][0]
+        assert "customerId" in message
+        assert "customer_id" in message
+
+    def test_alias_shared_by_two_fields_rejected(self):
+        class MySchema(Schema):
+            foo = fields.Int(load_aliases=["common"])
+            bar = fields.Int(load_aliases=["common"])
+
+        with pytest.raises(ValueError, match="load_aliases"):
+            MySchema()
+
+    def test_alias_colliding_with_other_field_name_rejected(self):
+        class MySchema(Schema):
+            foo = fields.Int(load_aliases=["bar"])
+            bar = fields.Int()
+
+        with pytest.raises(ValueError, match="load_aliases"):
+            MySchema()
+
+    def test_alias_colliding_with_other_field_data_key_rejected(self):
+        class MySchema(Schema):
+            foo = fields.Int(load_aliases=["Bar"])
+            bar = fields.Int(data_key="Bar")
+
+        with pytest.raises(ValueError, match="load_aliases"):
+            MySchema()
+
+    def test_alias_colliding_with_own_primary_key_rejected(self):
+        class MySchema(Schema):
+            foo = fields.Int(data_key="Foo", load_aliases=["Foo"])
+
+        with pytest.raises(ValueError, match="load_aliases"):
+            MySchema()
+
+    def test_alias_collision_checks_ignore_non_load_fields(self):
+        class MySchema(Schema):
+            foo = fields.Int(load_aliases=["bar"])
+            bar = fields.Int(dump_only=True)
+
+        # "bar" is dump-only, so the alias does not collide at load time
+        schema = MySchema()
+        assert schema.load({"bar": 2}) == {"foo": 2}
+
+        # Excluding "bar" also removes the collision
+        class BaseSchema(Schema):
+            foo = fields.Int(load_aliases=["bar"])
+            bar = fields.Int()
+
+        filtered_schema = BaseSchema(exclude=("bar",))
+        assert filtered_schema.load({"bar": 1}) == {"foo": 1}
+
+    def test_alias_collision_checks_apply_to_inherited_fields(self):
+        class BaseSchema(Schema):
+            foo = fields.Int(load_aliases=["bar"])
+
+        class ChildSchema(BaseSchema):
+            bar = fields.Int()
+
+        with pytest.raises(ValueError, match="load_aliases"):
+            ChildSchema()
+
+    def test_load_only_and_dump_only_options_affect_alias_checks(self):
+        class MySchema(Schema):
+            foo = fields.Int(load_aliases=["bar"])
+            bar = fields.Int()
+
+        # bar participates in loading here, so this collides
+        with pytest.raises(ValueError, match="load_aliases"):
+            MySchema()
+        # bar is dump-only, so no collision
+        schema = MySchema(dump_only=("bar",))
+        assert schema.load({"bar": 1}) == {"foo": 1}
+
+    def test_aliases_resolved_after_pre_load(self):
+        class MySchema(Schema):
+            customer_id = fields.Int(
+                data_key="customerId", load_aliases=["customer_id"]
+            )
+
+            @pre_load
+            def rename_key(self, data, **kwargs):
+                data = dict(data)
+                if "legacy_id" in data:
+                    data["customer_id"] = data.pop("legacy_id")
+                return data
+
+        assert MySchema().load({"legacy_id": 3}) == {"customer_id": 3}
+
+    def test_field_validators_and_post_load_called_once(self):
+        validator_calls = []
+        post_load_calls = []
+
+        class MySchema(Schema):
+            customer_id = fields.Int(
+                data_key="customerId", load_aliases=["customer_id"]
+            )
+
+            @validates("customer_id")
+            def validate_customer_id(self, value, **kwargs):
+                validator_calls.append(value)
+
+            @post_load
+            def make_object(self, data, **kwargs):
+                post_load_calls.append(data)
+                return data
+
+        assert MySchema().load({"customer_id": 1}) == {"customer_id": 1}
+        assert validator_calls == [1]
+        assert post_load_calls == [{"customer_id": 1}]
+
+    def test_consumed_alias_is_not_unknown(self):
+        with pytest.raises(ValidationError) as excinfo:
+            self.CustomerSchema(unknown=RAISE).load(
+                {"customer_id": 1, "name": "Alice", "extra": 1}
+            )
+        errors = excinfo.value.messages
+        assert list(errors) == ["extra"]
+
+        result = self.CustomerSchema(unknown=INCLUDE).load(
+            {"customer_id": 1, "name": "Alice", "extra": 1}
+        )
+        assert result == {"customer_id": 1, "name": "Alice", "extra": 1}
+
+    def test_errors_point_to_submitted_key(self):
+        class MySchema(Schema):
+            customer_id = fields.Int(
+                data_key="customerId", load_aliases=["customer_id"]
+            )
+
+        with pytest.raises(ValidationError) as excinfo:
+            MySchema().load({"customer_id": "not-an-int"})
+        errors = excinfo.value.messages
+        assert "customer_id" in errors
+        assert "customerId" not in errors
+
+    def test_partial_uses_internal_field_paths(self):
+        class MySchema(Schema):
+            customer_id = fields.Int(
+                data_key="customerId", load_aliases=["customer_id"], required=True
+            )
+
+        # partial refers to the internal field name
+        assert MySchema().load({}, partial=("customer_id",)) == {}
+        with pytest.raises(ValidationError) as excinfo:
+            MySchema().load({})
+        assert "customerId" in excinfo.value.messages
+
+    def test_nested_list_with_mixed_keys(self):
+        class InnerSchema(Schema):
+            customer_id = fields.Int(
+                data_key="customerId", load_aliases=["customer_id"]
+            )
+
+        class OuterSchema(Schema):
+            items = fields.List(fields.Nested(InnerSchema))
+
+        result = OuterSchema().load({"items": [{"customerId": 1}, {"customer_id": 2}]})
+        assert result == {"items": [{"customer_id": 1}, {"customer_id": 2}]}
+
+    def test_schema_instances_have_independent_alias_indexes(self):
+        class MySchema(Schema):
+            foo = fields.Int(load_aliases=["bar"])
+            bar = fields.Int()
+
+        # Instantiating a filtered schema must not raise nor affect others
+        filtered = MySchema(exclude=("bar",))
+        assert filtered.load({"bar": 1}) == {"foo": 1}
+        with pytest.raises(ValueError, match="load_aliases"):
+            MySchema()
+
+    def test_load_aliases_must_be_collection_of_strings(self):
+        with pytest.raises(StringNotCollectionError):
+            fields.Int(load_aliases="customer_id")
+        with pytest.raises(ValueError, match="load_aliases"):
+            fields.Int(load_aliases=[42])  # type: ignore[list-item]

@@ -302,6 +302,7 @@ class Schema(metaclass=SchemaMeta):
     _default_error_messages: dict[str, str] = {
         "type": "Invalid input type.",
         "unknown": "Unknown field.",
+        "ambiguous": "Ambiguous input: {keys} refer to the same field.",
     }
 
     OPTIONS_CLASS: type = SchemaOpts
@@ -648,7 +649,27 @@ class Schema(metaclass=SchemaMeta):
                 field_name = (
                     field_obj.data_key if field_obj.data_key is not None else attr_name
                 )
-                raw_value = data.get(field_name, missing)
+                input_key = field_name
+                if field_obj.load_aliases:
+                    present_keys = [
+                        key
+                        for key in (field_name, *field_obj.load_aliases)
+                        if key in data
+                    ]
+                    if len(present_keys) > 1:
+                        error_store.store_error(
+                            [
+                                self.error_messages["ambiguous"].format(
+                                    keys=", ".join(repr(key) for key in present_keys)
+                                )
+                            ],
+                            field_name,
+                            index=index,
+                        )
+                        continue
+                    if present_keys:
+                        input_key = present_keys[0]
+                raw_value = data.get(input_key, missing)
                 if raw_value is missing:
                     # Ignore missing field if we're allowed to.
                     if partial is True or (
@@ -668,7 +689,7 @@ class Schema(metaclass=SchemaMeta):
                     d_kwargs["partial"] = partial
 
                 def getter(
-                    val, field_obj=field_obj, field_name=field_name, d_kwargs=d_kwargs
+                    val, field_obj=field_obj, field_name=input_key, d_kwargs=d_kwargs
                 ):
                     return field_obj.deserialize(
                         val,
@@ -680,7 +701,7 @@ class Schema(metaclass=SchemaMeta):
                 value = self._call_and_store(
                     getter_func=getter,
                     data=raw_value,
-                    field_name=field_name,
+                    field_name=input_key,
                     error_store=error_store,
                     index=index,
                 )
@@ -692,6 +713,8 @@ class Schema(metaclass=SchemaMeta):
                     field_obj.data_key if field_obj.data_key is not None else field_name
                     for field_name, field_obj in self.load_fields.items()
                 }
+                # Aliases consumed during deserialization are known fields
+                fields |= self._load_aliases.keys()
                 for key in set(data) - fields:
                     value = data[key]
                     if unknown == INCLUDE:
@@ -1047,6 +1070,32 @@ class Schema(metaclass=SchemaMeta):
                 "Check the following field names and "
                 f"attribute arguments: {list(attributes_duplicates)}"
             )
+
+        # Build the index of load aliases for the fields that actually
+        # participate in deserialization. Aliases must not collide with any
+        # loadable field's primary input key (name or data_key), nor be
+        # claimed by more than one loadable field.
+        load_aliases: dict[str, str] = {}
+        primary_load_keys = {
+            field_obj.data_key if field_obj.data_key is not None else name
+            for name, field_obj in load_fields.items()
+        }
+        for name, field_obj in load_fields.items():
+            for alias in field_obj.load_aliases:
+                if alias in primary_load_keys:
+                    raise ValueError(
+                        f"The load_aliases argument {alias!r} for field "
+                        f"{name!r} collides with a field name or data_key "
+                        "argument."
+                    )
+                if alias in load_aliases:
+                    raise ValueError(
+                        f"The load_aliases argument {alias!r} is used by both "
+                        f"{load_aliases[alias]!r} and {name!r}."
+                    )
+                load_aliases[alias] = name
+        #: Dictionary mapping load aliases to field names
+        self._load_aliases: dict[str, str] = load_aliases
 
         self.fields = fields_dict
         self.dump_fields = dump_fields
