@@ -29,6 +29,7 @@ else:
     MonkeyPatch.patch_fromisoformat()
 
 from marshmallow import class_registry, types, utils, validate
+from marshmallow.budget import current_budget
 from marshmallow.constants import missing as missing_
 from marshmallow.exceptions import (
     StringNotCollectionError,
@@ -775,21 +776,45 @@ class List(Field[list[_InternalT | None]]):
     def _serialize(self, value, attr, obj, **kwargs) -> list[_InternalT] | None:
         if value is None:
             return None
+        budget = current_budget()
+        if budget is not None:
+            with budget.container(value):
+                ret = []
+                for idx, each in enumerate(value):
+                    with budget.segment(idx):
+                        budget.visit()
+                        ret.append(self.inner._serialize(each, attr, obj, **kwargs))
+                return ret
         return [self.inner._serialize(each, attr, obj, **kwargs) for each in value]
 
     def _deserialize(self, value, attr, data, **kwargs) -> list[_InternalT | None]:
         if not utils.is_collection(value):
             raise self.make_error("invalid")
 
+        budget = current_budget()
         result = []
         errors = {}
-        for idx, each in enumerate(value):
-            try:
-                result.append(self.inner.deserialize(each, **kwargs))
-            except ValidationError as error:
-                if error.valid_data is not None:
-                    result.append(typing.cast("_InternalT", error.valid_data))
-                errors.update({idx: error.messages})
+        if budget is not None:
+            with budget.container(value):
+                for idx, each in enumerate(value):
+                    with budget.segment(idx):
+                        budget.visit()
+                        try:
+                            result.append(self.inner.deserialize(each, **kwargs))
+                        except ValidationError as error:
+                            if error.valid_data is not None:
+                                result.append(
+                                    typing.cast("_InternalT", error.valid_data)
+                                )
+                            errors.update({idx: error.messages})
+        else:
+            for idx, each in enumerate(value):
+                try:
+                    result.append(self.inner.deserialize(each, **kwargs))
+                except ValidationError as error:
+                    if error.valid_data is not None:
+                        result.append(typing.cast("_InternalT", error.valid_data))
+                    errors.update({idx: error.messages})
         if errors:
             raise ValidationError(errors, valid_data=result)
         return result
@@ -858,6 +883,17 @@ class Tuple(Field[tuple]):
         if value is None:
             return None
 
+        budget = current_budget()
+        if budget is not None:
+            with budget.container(value):
+                ret = []
+                for idx, (field, each) in enumerate(
+                    zip(self.tuple_fields, value, strict=True)
+                ):
+                    with budget.segment(idx):
+                        budget.visit()
+                        ret.append(field._serialize(each, attr, obj, **kwargs))
+                return tuple(ret)
         return tuple(
             field._serialize(each, attr, obj, **kwargs)
             for field, each in zip(self.tuple_fields, value, strict=True)
@@ -878,13 +914,30 @@ class Tuple(Field[tuple]):
         result = []
         errors = {}
 
-        for idx, (field, each) in enumerate(zip(self.tuple_fields, value, strict=True)):
-            try:
-                result.append(field.deserialize(each, **kwargs))
-            except ValidationError as error:
-                if error.valid_data is not None:
-                    result.append(error.valid_data)
-                errors.update({idx: error.messages})
+        budget = current_budget()
+        if budget is not None:
+            with budget.container(value):
+                for idx, (field, each) in enumerate(
+                    zip(self.tuple_fields, value, strict=True)
+                ):
+                    with budget.segment(idx):
+                        budget.visit()
+                        try:
+                            result.append(field.deserialize(each, **kwargs))
+                        except ValidationError as error:
+                            if error.valid_data is not None:
+                                result.append(error.valid_data)
+                            errors.update({idx: error.messages})
+        else:
+            for idx, (field, each) in enumerate(
+                zip(self.tuple_fields, value, strict=True)
+            ):
+                try:
+                    result.append(field.deserialize(each, **kwargs))
+                except ValidationError as error:
+                    if error.valid_data is not None:
+                        result.append(error.valid_data)
+                    errors.update({idx: error.messages})
         if errors:
             raise ValidationError(errors, valid_data=result)
 
@@ -1662,6 +1715,9 @@ class Mapping(Field[_MappingT], metaclass=abc.ABCMeta):
     def _serialize(self, value, attr, obj, **kwargs):
         if value is None:
             return None
+        budget = current_budget()
+        if budget is not None:
+            return self._serialize_with_budget(value, budget, **kwargs)
         if not self.value_field and not self.key_field:
             return self.mapping_type(value)
 
@@ -1685,9 +1741,45 @@ class Mapping(Field[_MappingT], metaclass=abc.ABCMeta):
 
         return result
 
+    def _serialize_with_budget(self, value, budget, **kwargs):
+        """Serialize ``value``, charging the traversal to ``budget``."""
+        with budget.container(value):
+            if not self.value_field and not self.key_field:
+                budget.visit(len(value))
+                return self.mapping_type(value)
+
+            # Serialize keys
+            if self.key_field is None:
+                keys = {k: k for k in value}
+            else:
+                keys = {}
+                for k in value:
+                    with budget.segment(k):
+                        budget.visit()
+                        keys[k] = self.key_field._serialize(k, None, None, **kwargs)
+
+            # Serialize values
+            result = self.mapping_type()
+            if self.value_field is None:
+                for k, v in value.items():
+                    if k in keys:
+                        result[keys[k]] = v
+            else:
+                for k, v in value.items():
+                    with budget.segment(k):
+                        budget.visit()
+                        result[keys[k]] = self.value_field._serialize(
+                            v, None, None, **kwargs
+                        )
+
+            return result
+
     def _deserialize(self, value, attr, data, **kwargs):
         if not isinstance(value, _Mapping):
             raise self.make_error("invalid")
+        budget = current_budget()
+        if budget is not None:
+            return self._deserialize_with_budget(value, budget, **kwargs)
         if not self.value_field and not self.key_field:
             return self.mapping_type(value)
 
@@ -1726,6 +1818,53 @@ class Mapping(Field[_MappingT], metaclass=abc.ABCMeta):
             raise ValidationError(errors, valid_data=result)
 
         return result
+
+    def _deserialize_with_budget(self, value, budget, **kwargs):
+        """Deserialize ``value``, charging the traversal to ``budget``."""
+        with budget.container(value):
+            if not self.value_field and not self.key_field:
+                budget.visit(len(value))
+                return self.mapping_type(value)
+
+            errors = collections.defaultdict(dict)
+
+            # Deserialize keys
+            if self.key_field is None:
+                keys = {k: k for k in value}
+            else:
+                keys = {}
+                for key in value:
+                    with budget.segment(key):
+                        budget.visit()
+                        try:
+                            keys[key] = self.key_field.deserialize(key, **kwargs)
+                        except ValidationError as error:
+                            errors[key]["key"] = error.messages
+
+            # Deserialize values
+            result = self.mapping_type()
+            if self.value_field is None:
+                for k, v in value.items():
+                    if k in keys:
+                        result[keys[k]] = v
+            else:
+                for key, val in value.items():
+                    with budget.segment(key):
+                        budget.visit()
+                        try:
+                            deser_val = self.value_field.deserialize(val, **kwargs)
+                        except ValidationError as error:
+                            errors[key]["value"] = error.messages
+                            if error.valid_data is not None and key in keys:
+                                result[keys[key]] = error.valid_data
+                        else:
+                            if key in keys:
+                                result[keys[key]] = deser_val
+
+            if errors:
+                raise ValidationError(errors, valid_data=result)
+
+            return result
 
 
 class Dict(Mapping[dict]):

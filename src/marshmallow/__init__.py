@@ -1,4 +1,5 @@
 from marshmallow.constants import EXCLUDE, INCLUDE, RAISE, missing
+from marshmallow.budget import TraversalBudget
 from marshmallow.decorators import (
     post_dump,
     post_load,
@@ -18,6 +19,7 @@ __all__ = [
     "RAISE",
     "Schema",
     "SchemaOpts",
+    "TraversalBudget",
     "ValidationError",
     "fields",
     "missing",

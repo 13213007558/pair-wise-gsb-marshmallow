@@ -66,5 +66,49 @@ class StringNotCollectionError(MarshmallowError, TypeError):
     """Raised when a string is passed when a list of strings is expected."""
 
 
+class TraversalBudgetExceeded(MarshmallowError):
+    """Raised when a ``load``/``dump`` call exhausts its traversal budget.
+
+    This is raised when the number of visited nodes exceeds ``max_nodes``
+    or the container nesting depth exceeds ``max_depth``. It is not a
+    `ValidationError`, so it is never swallowed by field-level error
+    handling and always aborts the traversal immediately.
+
+    :param message: Error message.
+    :param path: Path to the position where the budget was exhausted, as a
+        tuple of external field names (``data_key``) and collection indices.
+
+    .. versionadded:: 4.4.0
+    """
+
+    def __init__(self, message: str, *, path: typing.Iterable = ()):
+        self.message = message
+        #: Path to the position where the budget was exhausted.
+        self.path = tuple(path)
+        super().__init__(message)
+
+    @property
+    def messages(self) -> list | dict:
+        """The error message nested by :attr:`path`, mirroring the structure
+        of `ValidationError.messages <marshmallow.exceptions.ValidationError>`.
+        """
+        messages: list | dict = [self.message]
+        for segment in reversed(self.path):
+            messages = {segment: messages}
+        return messages
+
+
+class TraversalCycleError(TraversalBudgetExceeded):
+    """Raised when a container cycle is detected along the current ancestor
+    chain during a budgeted traversal.
+
+    Only containers on the current traversal path are considered, so objects
+    that are legitimately shared between sibling positions (diamond-shaped
+    object graphs) are not reported as cycles.
+
+    .. versionadded:: 4.4.0
+    """
+
+
 class _FieldInstanceResolutionError(MarshmallowError, TypeError):
     """Raised when an argument is passed to a field class that cannot be resolved to a Field instance."""

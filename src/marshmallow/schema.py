@@ -20,6 +20,8 @@ from itertools import zip_longest
 
 from marshmallow import class_registry, types
 from marshmallow import fields as ma_fields
+from marshmallow.budget import current_budget
+from marshmallow.budget import resolve as _resolve_budget
 from marshmallow.constants import EXCLUDE, INCLUDE, RAISE, missing
 from marshmallow.decorators import (
     POST_DUMP,
@@ -40,6 +42,7 @@ from marshmallow.utils import (
 )
 
 if typing.TYPE_CHECKING:
+    from marshmallow.budget import TraversalBudget
     from marshmallow.fields import Field
 
 
@@ -534,6 +537,9 @@ class Schema(metaclass=SchemaMeta):
         :param many: `True` if ``obj`` should be serialized as a collection.
         :return: A dictionary of the serialized data
         """
+        budget = current_budget()
+        if budget is not None:
+            return self._serialize_with_budget(obj, many=many, budget=budget)
         if many and obj is not None:
             return [self._serialize(d, many=False) for d in obj]
         ret = self.dict_class()
@@ -545,13 +551,60 @@ class Schema(metaclass=SchemaMeta):
             ret[key] = value
         return ret
 
-    def dump(self, obj: typing.Any, *, many: bool | None = None):
+    def _serialize_with_budget(
+        self, obj: typing.Any, *, many: bool, budget: TraversalBudget
+    ):
+        """Serialize ``obj``, charging the traversal to ``budget``."""
+        if many and obj is not None:
+            with budget.container(obj):
+                ret_l = []
+                for idx, item in enumerate(obj):
+                    with budget.segment(idx):
+                        budget.visit()
+                        ret_l.append(
+                            self._serialize_with_budget(
+                                item, many=False, budget=budget
+                            )
+                        )
+                return ret_l
+        with budget.container(obj):
+            ret = self.dict_class()
+            for attr_name, field_obj in self.dump_fields.items():
+                key = (
+                    field_obj.data_key if field_obj.data_key is not None else attr_name
+                )
+                with budget.segment(key):
+                    budget.visit()
+                    value = field_obj.serialize(
+                        attr_name, obj, accessor=self.get_attribute
+                    )
+                if value is missing:
+                    continue
+                ret[key] = value
+            return ret
+
+    def dump(
+        self,
+        obj: typing.Any,
+        *,
+        many: bool | None = None,
+        max_depth: int | None = None,
+        max_nodes: int | None = None,
+        budget: TraversalBudget | None = None,
+    ):
         """Serialize an object to native Python data types according to this
         Schema's fields.
 
         :param obj: The object to serialize.
         :param many: Whether to serialize `obj` as a collection. If `None`, the value
             for `self.many` is used.
+        :param max_depth: If set, limit the container nesting depth traversed
+            by this call. The root container is depth 1.
+        :param max_nodes: If set, limit the number of nodes visited by this call.
+        :param budget: A `TraversalBudget <marshmallow.budget.TraversalBudget>`
+            to charge this call to. Mutually exclusive with ``max_depth`` and
+            ``max_nodes``. The budget is shared with all nested fields and
+            ``many=True`` items of this call.
         :return: Serialized data
 
         .. versionchanged:: 3.0.0b7
@@ -560,23 +613,28 @@ class Schema(metaclass=SchemaMeta):
             if ``obj`` is invalid.
         .. versionchanged:: 3.0.0rc9
             Validation no longer occurs upon serialization.
+        .. versionchanged:: 4.4.0
+            Added ``max_depth``, ``max_nodes`` and ``budget`` parameters.
         """
         many = self.many if many is None else bool(many)
-        if self._hooks[PRE_DUMP]:
-            processed_obj = self._invoke_dump_processors(
-                PRE_DUMP, obj, many=many, original_data=obj
-            )
-        else:
-            processed_obj = obj
+        with _resolve_budget(budget, max_depth, max_nodes) as active_budget:
+            if active_budget is not None:
+                active_budget.visit()
+            if self._hooks[PRE_DUMP]:
+                processed_obj = self._invoke_dump_processors(
+                    PRE_DUMP, obj, many=many, original_data=obj
+                )
+            else:
+                processed_obj = obj
 
-        result = self._serialize(processed_obj, many=many)
+            result = self._serialize(processed_obj, many=many)
 
-        if self._hooks[POST_DUMP]:
-            result = self._invoke_dump_processors(
-                POST_DUMP, result, many=many, original_data=obj
-            )
+            if self._hooks[POST_DUMP]:
+                result = self._invoke_dump_processors(
+                    POST_DUMP, result, many=many, original_data=obj
+                )
 
-        return result
+            return result
 
     def dumps(self, obj: typing.Any, *args, many: bool | None = None, **kwargs):
         """Same as :meth:`dump`, except return a JSON-encoded string.
@@ -621,6 +679,17 @@ class Schema(metaclass=SchemaMeta):
         instances if `many` is `True`.
         """
         index = index if self.opts.index_errors else None
+        budget = current_budget()
+        if budget is not None:
+            return self._deserialize_with_budget(
+                data,
+                error_store=error_store,
+                many=many,
+                partial=partial,
+                unknown=unknown,
+                index=index,
+                budget=budget,
+            )
         if many:
             if not is_sequence_but_not_string(data):
                 error_store.store_error([self.error_messages["type"]], index=index)
@@ -704,6 +773,118 @@ class Schema(metaclass=SchemaMeta):
                         )
         return ret_d
 
+    def _deserialize_with_budget(
+        self,
+        data: Mapping[str, typing.Any] | Sequence[Mapping[str, typing.Any]],
+        *,
+        error_store: ErrorStore,
+        many: bool,
+        partial,
+        unknown: types.UnknownOption,
+        index,
+        budget: TraversalBudget,
+    ) -> typing.Any | list[typing.Any]:
+        """Deserialize ``data``, charging the traversal to ``budget``."""
+        if many:
+            if not is_sequence_but_not_string(data):
+                error_store.store_error([self.error_messages["type"]], index=index)
+                return []
+            with budget.container(data):
+                ret_l = []
+                for idx, item in enumerate(data):
+                    with budget.segment(idx):
+                        budget.visit()
+                        ret_l.append(
+                            self._deserialize_with_budget(
+                                item,
+                                error_store=error_store,
+                                many=False,
+                                partial=partial,
+                                unknown=unknown,
+                                index=idx,
+                                budget=budget,
+                            )
+                        )
+                return ret_l
+        with budget.container(data):
+            ret_d = self.dict_class()
+            # Check data is a dict
+            if not isinstance(data, Mapping):
+                error_store.store_error([self.error_messages["type"]], index=index)
+            else:
+                partial_is_collection = is_collection(partial)
+                for attr_name, field_obj in self.load_fields.items():
+                    field_name = (
+                        field_obj.data_key
+                        if field_obj.data_key is not None
+                        else attr_name
+                    )
+                    raw_value = data.get(field_name, missing)
+                    if raw_value is missing:
+                        # Ignore missing field if we're allowed to.
+                        if partial is True or (
+                            partial_is_collection and attr_name in partial
+                        ):
+                            continue
+                    d_kwargs = {}
+                    # Allow partial loading of nested schemas.
+                    if partial_is_collection:
+                        prefix = attr_name + "."
+                        len_prefix = len(prefix)
+                        sub_partial = [
+                            f[len_prefix:] for f in partial if f.startswith(prefix)
+                        ]
+                        d_kwargs["partial"] = sub_partial
+                    elif partial is not None:
+                        d_kwargs["partial"] = partial
+
+                    def getter(
+                        val,
+                        field_obj=field_obj,
+                        field_name=field_name,
+                        d_kwargs=d_kwargs,
+                    ):
+                        return field_obj.deserialize(
+                            val,
+                            field_name,
+                            data,
+                            **d_kwargs,
+                        )
+
+                    with budget.segment(field_name):
+                        if raw_value is not missing:
+                            budget.visit()
+                        value = self._call_and_store(
+                            getter_func=getter,
+                            data=raw_value,
+                            field_name=field_name,
+                            error_store=error_store,
+                            index=index,
+                        )
+                    if value is not missing:
+                        key = field_obj.attribute or attr_name
+                        set_value(ret_d, key, value)
+                if unknown != EXCLUDE:
+                    fields = {
+                        field_obj.data_key
+                        if field_obj.data_key is not None
+                        else field_name
+                        for field_name, field_obj in self.load_fields.items()
+                    }
+                    for key in set(data) - fields:
+                        value = data[key]
+                        if unknown == INCLUDE:
+                            with budget.segment(key):
+                                budget.visit()
+                                ret_d[key] = value
+                        elif unknown == RAISE:
+                            error_store.store_error(
+                                [self.error_messages["unknown"]],
+                                key,
+                                index,
+                            )
+        return ret_d
+
     def load(
         self,
         data: Mapping[str, typing.Any] | Sequence[Mapping[str, typing.Any]],
@@ -711,6 +892,9 @@ class Schema(metaclass=SchemaMeta):
         many: bool | None = None,
         partial: bool | types.StrSequenceOrSet | None = None,
         unknown: types.UnknownOption | None = None,
+        max_depth: int | None = None,
+        max_nodes: int | None = None,
+        budget: TraversalBudget | None = None,
     ):
         """Deserialize a data structure to an object defined by this Schema's fields.
 
@@ -724,16 +908,28 @@ class Schema(metaclass=SchemaMeta):
         :param unknown: Whether to exclude, include, or raise an error for unknown
             fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
             If `None`, the value for `self.unknown` is used.
+        :param max_depth: If set, limit the container nesting depth traversed
+            by this call. The root container is depth 1.
+        :param max_nodes: If set, limit the number of nodes visited by this call.
+        :param budget: A `TraversalBudget <marshmallow.budget.TraversalBudget>`
+            to charge this call to. Mutually exclusive with ``max_depth`` and
+            ``max_nodes``. The budget is shared with all nested fields and
+            ``many=True`` items of this call.
         :return: Deserialized data
 
         .. versionchanged:: 3.0.0b7
             This method returns the deserialized data rather than a ``(data, errors)`` tuple.
             A :exc:`ValidationError <marshmallow.exceptions.ValidationError>` is raised
             if invalid data are passed.
+        .. versionchanged:: 4.4.0
+            Added ``max_depth``, ``max_nodes`` and ``budget`` parameters.
         """
-        return self._do_load(
-            data, many=many, partial=partial, unknown=unknown, postprocess=True
-        )
+        with _resolve_budget(budget, max_depth, max_nodes) as active_budget:
+            if active_budget is not None:
+                active_budget.visit()
+            return self._do_load(
+                data, many=many, partial=partial, unknown=unknown, postprocess=True
+            )
 
     def loads(
         self,

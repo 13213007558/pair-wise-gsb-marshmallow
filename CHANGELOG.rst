@@ -6,6 +6,16 @@ Changelog
 
 Features:
 
+- Add optional traversal budgets to `Schema.load <marshmallow.Schema.load>`
+  and `Schema.dump <marshmallow.Schema.dump>` via the ``max_depth``,
+  ``max_nodes`` and ``budget`` parameters. A budget limits container nesting
+  depth and the number of visited nodes for a single call, is shared by
+  nested fields and ``many=True`` items, detects container cycles along the
+  current ancestor chain, and reports the exhausted position with external
+  field names and collection indices through
+  `TraversalBudgetExceeded <marshmallow.exceptions.TraversalBudgetExceeded>`.
+  Custom fields can participate in the ambient budget with the helpers in
+  the new `marshmallow.budget` module.
 - Simplify `get_value` to match actual usage (:pr:`3024`).
 
 Bug fixes:
