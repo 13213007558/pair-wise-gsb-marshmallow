@@ -6,6 +6,21 @@ Changelog
 
 Features:
 
+- Add optional per-call traversal budgets: pass a
+  `TraversalBudget <marshmallow.TraversalBudget>` to
+  `Schema.load <marshmallow.Schema.load>`/`Schema.dump <marshmallow.Schema.dump>`
+  (and ``loads``, ``dumps``, ``validate``) to limit the number of visited
+  nodes (``max_nodes``) and the container depth (``max_depth``).
+  `Nested <marshmallow.fields.Nested>`, `List <marshmallow.fields.List>`,
+  `Tuple <marshmallow.fields.Tuple>`, and `Dict <marshmallow.fields.Dict>`
+  share one budget per call, including all ``many=True`` items. Self
+  references on the current ancestor chain raise
+  `CircularReferenceError <marshmallow.CircularReferenceError>` while shared
+  (diamond) references keep working and are billed per visit. Budget errors
+  report their location through ``path``/``path_string`` using external field
+  names and actual indices. Custom fields can participate through
+  `current_budget <marshmallow.current_budget>` and
+  `TraversalBudget.visit_node <marshmallow.TraversalBudget.visit_node>`.
 - Simplify `get_value` to match actual usage (:pr:`3024`).
 
 Bug fixes:

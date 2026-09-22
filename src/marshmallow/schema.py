@@ -32,6 +32,13 @@ from marshmallow.decorators import (
 from marshmallow.error_store import ErrorStore
 from marshmallow.exceptions import SCHEMA, StringNotCollectionError, ValidationError
 from marshmallow.orderedset import OrderedSet
+from marshmallow.traversal import (
+    _NO_BUDGET,
+    TraversalBudget,
+)
+from marshmallow.traversal import (
+    _Budget as _BudgetType,
+)
 from marshmallow.utils import (
     get_value,
     is_collection,
@@ -527,7 +534,14 @@ class Schema(metaclass=SchemaMeta):
             return error.valid_data or missing
         return value
 
-    def _serialize(self, obj: typing.Any, *, many: bool = False):
+    def _serialize(
+        self,
+        obj: typing.Any,
+        *,
+        many: bool = False,
+        _budget: _BudgetType = _NO_BUDGET,
+        _key: typing.Any = None,
+    ):
         """Serialize ``obj``.
 
         :param obj: The object(s) to serialize.
@@ -535,23 +549,47 @@ class Schema(metaclass=SchemaMeta):
         :return: A dictionary of the serialized data
         """
         if many and obj is not None:
-            return [self._serialize(d, many=False) for d in obj]
-        ret = self.dict_class()
-        for attr_name, field_obj in self.dump_fields.items():
-            value = field_obj.serialize(attr_name, obj, accessor=self.get_attribute)
-            if value is missing:
-                continue
-            key = field_obj.data_key if field_obj.data_key is not None else attr_name
-            ret[key] = value
-        return ret
+            with _budget.visit_container(obj, _key):
+                return [
+                    self._serialize(d, many=False, _budget=_budget, _key=idx)
+                    for idx, d in enumerate(obj)
+                ]
+        with _budget.visit_container(obj, _key):
+            ret = self.dict_class()
+            for attr_name, field_obj in self.dump_fields.items():
+                data_key = (
+                    field_obj.data_key if field_obj.data_key is not None else attr_name
+                )
+                value = field_obj.serialize(
+                    attr_name,
+                    obj,
+                    accessor=self.get_attribute,
+                    _budget=_budget,
+                    _key=data_key,
+                )
+                if value is missing:
+                    continue
+                ret[data_key] = value
+            return ret
 
-    def dump(self, obj: typing.Any, *, many: bool | None = None):
+    def dump(
+        self,
+        obj: typing.Any,
+        *,
+        many: bool | None = None,
+        budget: TraversalBudget | None = None,
+        _budget: _BudgetType = _NO_BUDGET,
+        _key: typing.Any = None,
+    ):
         """Serialize an object to native Python data types according to this
         Schema's fields.
 
         :param obj: The object to serialize.
         :param many: Whether to serialize `obj` as a collection. If `None`, the value
             for `self.many` is used.
+        :param budget: Optional per-call `TraversalBudget` limiting the number
+            of visited nodes and the container depth. When `None` (the
+            default), traversal is unbounded and existing behavior is kept.
         :return: Serialized data
 
         .. versionchanged:: 3.0.0b7
@@ -562,23 +600,34 @@ class Schema(metaclass=SchemaMeta):
             Validation no longer occurs upon serialization.
         """
         many = self.many if many is None else bool(many)
-        if self._hooks[PRE_DUMP]:
-            processed_obj = self._invoke_dump_processors(
-                PRE_DUMP, obj, many=many, original_data=obj
+        active_budget = budget or _budget
+        with active_budget.activate():
+            if self._hooks[PRE_DUMP]:
+                processed_obj = self._invoke_dump_processors(
+                    PRE_DUMP, obj, many=many, original_data=obj
+                )
+            else:
+                processed_obj = obj
+
+            result = self._serialize(
+                processed_obj, many=many, _budget=active_budget, _key=_key
             )
-        else:
-            processed_obj = obj
 
-        result = self._serialize(processed_obj, many=many)
+            if self._hooks[POST_DUMP]:
+                result = self._invoke_dump_processors(
+                    POST_DUMP, result, many=many, original_data=obj
+                )
 
-        if self._hooks[POST_DUMP]:
-            result = self._invoke_dump_processors(
-                POST_DUMP, result, many=many, original_data=obj
-            )
+            return result
 
-        return result
-
-    def dumps(self, obj: typing.Any, *args, many: bool | None = None, **kwargs):
+    def dumps(
+        self,
+        obj: typing.Any,
+        *args,
+        many: bool | None = None,
+        budget: TraversalBudget | None = None,
+        **kwargs,
+    ):
         """Same as :meth:`dump`, except return a JSON-encoded string.
 
         :param obj: The object to serialize.
@@ -591,7 +640,7 @@ class Schema(metaclass=SchemaMeta):
             A :exc:`ValidationError <marshmallow.exceptions.ValidationError>` is raised
             if ``obj`` is invalid.
         """
-        serialized = self.dump(obj, many=many)
+        serialized = self.dump(obj, many=many, budget=budget)
         return self.opts.render_module.dumps(serialized, *args, **kwargs)
 
     def _deserialize(
@@ -603,6 +652,8 @@ class Schema(metaclass=SchemaMeta):
         partial=None,
         unknown: types.UnknownOption = RAISE,
         index=None,
+        _budget: _BudgetType = _NO_BUDGET,
+        _key: typing.Any = None,
     ) -> typing.Any | list[typing.Any]:
         """Deserialize ``data``.
 
@@ -624,9 +675,9 @@ class Schema(metaclass=SchemaMeta):
         if many:
             if not is_sequence_but_not_string(data):
                 error_store.store_error([self.error_messages["type"]], index=index)
-                ret_l = []
-            else:
-                ret_l = [
+                return []
+            with _budget.visit_container(data, _key):
+                return [
                     self._deserialize(
                         d,
                         error_store=error_store,
@@ -634,74 +685,86 @@ class Schema(metaclass=SchemaMeta):
                         partial=partial,
                         unknown=unknown,
                         index=idx,
+                        _budget=_budget,
+                        _key=idx,
                     )
                     for idx, d in enumerate(data)
                 ]
-            return ret_l
         ret_d = self.dict_class()
         # Check data is a dict
         if not isinstance(data, Mapping):
             error_store.store_error([self.error_messages["type"]], index=index)
         else:
-            partial_is_collection = is_collection(partial)
-            for attr_name, field_obj in self.load_fields.items():
-                field_name = (
-                    field_obj.data_key if field_obj.data_key is not None else attr_name
-                )
-                raw_value = data.get(field_name, missing)
-                if raw_value is missing:
-                    # Ignore missing field if we're allowed to.
-                    if partial is True or (
-                        partial_is_collection and attr_name in partial
-                    ):
-                        continue
-                d_kwargs = {}
-                # Allow partial loading of nested schemas.
-                if partial_is_collection:
-                    prefix = attr_name + "."
-                    len_prefix = len(prefix)
-                    sub_partial = [
-                        f[len_prefix:] for f in partial if f.startswith(prefix)
-                    ]
-                    d_kwargs["partial"] = sub_partial
-                elif partial is not None:
-                    d_kwargs["partial"] = partial
-
-                def getter(
-                    val, field_obj=field_obj, field_name=field_name, d_kwargs=d_kwargs
-                ):
-                    return field_obj.deserialize(
-                        val,
-                        field_name,
-                        data,
-                        **d_kwargs,
+            with _budget.visit_container(data, _key):
+                partial_is_collection = is_collection(partial)
+                for attr_name, field_obj in self.load_fields.items():
+                    field_name = (
+                        field_obj.data_key
+                        if field_obj.data_key is not None
+                        else attr_name
                     )
+                    raw_value = data.get(field_name, missing)
+                    if raw_value is missing:
+                        # Ignore missing field if we're allowed to.
+                        if partial is True or (
+                            partial_is_collection and attr_name in partial
+                        ):
+                            continue
+                    d_kwargs = {}
+                    # Allow partial loading of nested schemas.
+                    if partial_is_collection:
+                        prefix = attr_name + "."
+                        len_prefix = len(prefix)
+                        sub_partial = [
+                            f[len_prefix:] for f in partial if f.startswith(prefix)
+                        ]
+                        d_kwargs["partial"] = sub_partial
+                    elif partial is not None:
+                        d_kwargs["partial"] = partial
 
-                value = self._call_and_store(
-                    getter_func=getter,
-                    data=raw_value,
-                    field_name=field_name,
-                    error_store=error_store,
-                    index=index,
-                )
-                if value is not missing:
-                    key = field_obj.attribute or attr_name
-                    set_value(ret_d, key, value)
-            if unknown != EXCLUDE:
-                fields = {
-                    field_obj.data_key if field_obj.data_key is not None else field_name
-                    for field_name, field_obj in self.load_fields.items()
-                }
-                for key in set(data) - fields:
-                    value = data[key]
-                    if unknown == INCLUDE:
-                        ret_d[key] = value
-                    elif unknown == RAISE:
-                        error_store.store_error(
-                            [self.error_messages["unknown"]],
-                            key,
-                            index,
+                    def getter(
+                        val,
+                        field_obj=field_obj,
+                        field_name=field_name,
+                        d_kwargs=d_kwargs,
+                    ):
+                        return field_obj.deserialize(
+                            val,
+                            field_name,
+                            data,
+                            _budget=_budget,
+                            _key=field_name,
+                            **d_kwargs,
                         )
+
+                    value = self._call_and_store(
+                        getter_func=getter,
+                        data=raw_value,
+                        field_name=field_name,
+                        error_store=error_store,
+                        index=index,
+                    )
+                    if value is not missing:
+                        key = field_obj.attribute or attr_name
+                        set_value(ret_d, key, value)
+                if unknown != EXCLUDE:
+                    fields = {
+                        field_obj.data_key
+                        if field_obj.data_key is not None
+                        else field_name
+                        for field_name, field_obj in self.load_fields.items()
+                    }
+                    for key in set(data) - fields:
+                        value = data[key]
+                        _budget.visit_node(key)
+                        if unknown == INCLUDE:
+                            ret_d[key] = value
+                        elif unknown == RAISE:
+                            error_store.store_error(
+                                [self.error_messages["unknown"]],
+                                key,
+                                index,
+                            )
         return ret_d
 
     def load(
@@ -711,6 +774,9 @@ class Schema(metaclass=SchemaMeta):
         many: bool | None = None,
         partial: bool | types.StrSequenceOrSet | None = None,
         unknown: types.UnknownOption | None = None,
+        budget: TraversalBudget | None = None,
+        _budget: _BudgetType = _NO_BUDGET,
+        _key: typing.Any = None,
     ):
         """Deserialize a data structure to an object defined by this Schema's fields.
 
@@ -724,6 +790,9 @@ class Schema(metaclass=SchemaMeta):
         :param unknown: Whether to exclude, include, or raise an error for unknown
             fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
             If `None`, the value for `self.unknown` is used.
+        :param budget: Optional per-call `TraversalBudget` limiting the number
+            of visited nodes and the container depth. When `None` (the
+            default), traversal is unbounded and existing behavior is kept.
         :return: Deserialized data
 
         .. versionchanged:: 3.0.0b7
@@ -731,9 +800,17 @@ class Schema(metaclass=SchemaMeta):
             A :exc:`ValidationError <marshmallow.exceptions.ValidationError>` is raised
             if invalid data are passed.
         """
-        return self._do_load(
-            data, many=many, partial=partial, unknown=unknown, postprocess=True
-        )
+        active_budget = budget or _budget
+        with active_budget.activate():
+            return self._do_load(
+                data,
+                many=many,
+                partial=partial,
+                unknown=unknown,
+                postprocess=True,
+                _budget=active_budget,
+                _key=_key,
+            )
 
     def loads(
         self,
@@ -743,6 +820,7 @@ class Schema(metaclass=SchemaMeta):
         many: bool | None = None,
         partial: bool | types.StrSequenceOrSet | None = None,
         unknown: types.UnknownOption | None = None,
+        budget: TraversalBudget | None = None,
         **kwargs,
     ):
         """Same as :meth:`load`, except it uses `marshmallow.Schema.Meta.render_module` to deserialize
@@ -768,7 +846,13 @@ class Schema(metaclass=SchemaMeta):
             Rename ``json_module`` parameter to ``s``.
         """
         data = self.opts.render_module.loads(s, **kwargs)
-        return self.load(data, many=many, partial=partial, unknown=unknown)
+        return self.load(
+            data,
+            many=many,
+            partial=partial,
+            unknown=unknown,
+            budget=budget,
+        )
 
     def _run_validator(
         self,
@@ -818,6 +902,7 @@ class Schema(metaclass=SchemaMeta):
         *,
         many: bool | None = None,
         partial: bool | types.StrSequenceOrSet | None = None,
+        budget: TraversalBudget | None = None,
     ) -> dict[str, list[str]]:
         """Validate `data` against the schema, returning a dictionary of
         validation errors.
@@ -829,10 +914,19 @@ class Schema(metaclass=SchemaMeta):
             any fields declared. Propagates down to ``Nested`` fields as well. If
             its value is an iterable, only missing fields listed in that iterable
             will be ignored. Use dot delimiters to specify nested fields.
+        :param budget: Optional per-call `TraversalBudget`.
         :return: A dictionary of validation errors.
         """
+        active_budget = budget or _NO_BUDGET
         try:
-            self._do_load(data, many=many, partial=partial, postprocess=False)
+            with active_budget.activate():
+                self._do_load(
+                    data,
+                    many=many,
+                    partial=partial,
+                    postprocess=False,
+                    _budget=active_budget,
+                )
         except ValidationError as exc:
             return typing.cast("dict[str, list[str]]", exc.messages)
         return {}
@@ -847,6 +941,8 @@ class Schema(metaclass=SchemaMeta):
         partial: bool | types.StrSequenceOrSet | None = None,
         unknown: types.UnknownOption | None = None,
         postprocess: bool = True,
+        _budget: _BudgetType = _NO_BUDGET,
+        _key: typing.Any = None,
     ):
         """Deserialize `data`, returning the deserialized result.
         This method is private API.
@@ -894,6 +990,8 @@ class Schema(metaclass=SchemaMeta):
                 many=many,
                 partial=partial,
                 unknown=unknown,
+                _budget=_budget,
+                _key=_key,
             )
             # Run field-level validation
             self._invoke_field_validators(

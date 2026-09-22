@@ -9,6 +9,13 @@ from marshmallow.decorators import (
 )
 from marshmallow.exceptions import ValidationError
 from marshmallow.schema import Schema, SchemaOpts
+from marshmallow.traversal import (
+    CircularReferenceError,
+    TraversalBudget,
+    TraversalBudgetExceededError,
+    TraversalError,
+    current_budget,
+)
 
 from . import fields
 
@@ -16,9 +23,14 @@ __all__ = [
     "EXCLUDE",
     "INCLUDE",
     "RAISE",
+    "CircularReferenceError",
     "Schema",
     "SchemaOpts",
+    "TraversalBudget",
+    "TraversalBudgetExceededError",
+    "TraversalError",
     "ValidationError",
+    "current_budget",
     "fields",
     "missing",
     "post_dump",

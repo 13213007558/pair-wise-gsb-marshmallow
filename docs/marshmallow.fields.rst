@@ -8,6 +8,7 @@ Base Field Class
 
 .. autoclass:: marshmallow.fields.Field
     :private-members:
+    :exclude-members: _serialize_value
 
 Field subclasses
 ----------------

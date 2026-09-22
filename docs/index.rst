@@ -52,6 +52,7 @@ Usage guide
     install
     quickstart
     nesting
+    traversal_budget
     custom_fields
     extending/index
     examples/index
