@@ -92,6 +92,7 @@ class _BaseFieldKwargs(typing.TypedDict, total=False):
     load_default: typing.Any
     dump_default: typing.Any
     data_key: str | None
+    load_aliases: types.StrSequenceOrSet | None
     attribute: str | None
     validate: types.Validator | typing.Iterable[types.Validator] | None
     pre_load: types.PreLoadCallable | typing.Iterable[types.PreLoadCallable] | None
@@ -130,6 +131,12 @@ class Field(typing.Generic[_InternalT]):
     :param data_key: The name of the dict key in the external representation, i.e.
         the input of `load` and the output of `dump`.
         If `None`, the key will match the name of the field.
+    :param load_aliases: Additional dict keys that are accepted as aliases for
+        this field when loading input data. The primary load name is the
+        ``data_key`` if given, otherwise the field name. Dumping always uses
+        the primary name. If the same payload provides a value under more than
+        one of the accepted names (even identical values), loading fails with
+        an ambiguous-field error.
     :param attribute: The name of the key/attribute in the internal representation, i.e.
         the output of `load` and the input of `dump`.
         If `None`, the key/attribute will match the name of the field.
@@ -173,6 +180,8 @@ class Field(typing.Generic[_InternalT]):
         Remove ``context`` property.
     .. versionchanged:: 4.3.0
         Add ``pre_load`` and ``post_load``.
+    .. versionchanged:: 4.4.0
+        Add ``load_aliases``.
     """
 
     # Some fields, such as Method fields and Function fields, are not expected
@@ -187,6 +196,10 @@ class Field(typing.Generic[_InternalT]):
         "required": "Missing data for required field.",
         "null": "Field may not be null.",
         "validator_failed": "Invalid value.",
+        "ambiguous": (
+            "Multiple values were provided for this field "
+            "under the following keys: {input_keys}."
+        ),
     }
 
     def __init__(
@@ -195,6 +208,7 @@ class Field(typing.Generic[_InternalT]):
         load_default: typing.Any = missing_,
         dump_default: typing.Any = missing_,
         data_key: str | None = None,
+        load_aliases: types.StrSequenceOrSet | None = None,
         attribute: str | None = None,
         validate: types.Validator | typing.Iterable[types.Validator] | None = None,
         pre_load: (
@@ -215,6 +229,16 @@ class Field(typing.Generic[_InternalT]):
 
         self.attribute = attribute
         self.data_key = data_key
+        if load_aliases is None:
+            self.load_aliases: tuple[str, ...] = ()
+        else:
+            if not utils.is_collection(load_aliases):
+                raise StringNotCollectionError(
+                    '"load_aliases" should be a collection of strings.'
+                )
+            if not all(isinstance(alias, str) for alias in load_aliases):
+                raise ValueError('"load_aliases" must contain only strings.')
+            self.load_aliases = tuple(dict.fromkeys(load_aliases))
         self.validate = validate
         self.validators = self._normalize_processors(validate, param="validate")
         self.pre_load = self._normalize_processors(pre_load, param="pre_load")

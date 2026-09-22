@@ -553,6 +553,30 @@ If you are consuming and producing data that does not match your schema, you can
     # 'email': 'foo@bar.com'}
 
 
+Accepting extra keys on load
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When a field is renamed (e.g. ``customer_id`` becomes ``customerId``) and old
+clients keep sending the previous name, use the ``load_aliases`` argument to
+accept additional input keys. Dumping always uses the primary name (the field
+name or its ``data_key``); aliases only affect loading.
+
+.. code-block:: python
+
+    class CustomerSchema(Schema):
+        customer_id = fields.Integer(load_aliases=("customerId",))
+
+
+    CustomerSchema().load({"customerId": 1})  # {'customer_id': 1}
+    CustomerSchema().dump({"customer_id": 1})  # {'customer_id': 1}
+
+If a payload provides several accepted keys for the same field (even with
+identical values), a :exc:`marshmallow.ValidationError` is raised and the
+conflicting input keys are listed in the error message. An alias that another
+loadable field already uses as its primary name, or that is shared by two
+fields, raises a ``ValueError`` when the schema is instantiated.
+
+
 Next steps
 ----------
 - Need to represent relationships between objects? See the :doc:`nesting` page.

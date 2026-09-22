@@ -439,6 +439,8 @@ class Schema(metaclass=SchemaMeta):
         self.fields: dict[str, Field] = {}
         self.load_fields: dict[str, Field] = {}
         self.dump_fields: dict[str, Field] = {}
+        #: Mapping of accepted load input keys -> field attribute name
+        self._load_alias_index: dict[str, str] = {}
         self._init_fields()
         messages = {}
         messages.update(self._default_error_messages)
@@ -603,7 +605,9 @@ class Schema(metaclass=SchemaMeta):
         partial=None,
         unknown: types.UnknownOption = RAISE,
         index=None,
-    ) -> typing.Any | list[typing.Any]:
+    ) -> tuple[
+        typing.Any | list[typing.Any], list[dict[str, str]] | dict[str, str]
+    ]:
         """Deserialize ``data``.
 
         :param data: The data to deserialize.
@@ -617,38 +621,53 @@ class Schema(metaclass=SchemaMeta):
             fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
         :param index: Index of the item being deserialized (for storing errors) if
             deserializing a collection, otherwise `None`.
-        :return: The deserialized data as `dict_class` instance or list of `dict_class`
-        instances if `many` is `True`.
+        :return: A tuple of the deserialized data (a `dict_class` instance or a list
+        of `dict_class` instances if `many` is `True`) and, for each deserialized
+        mapping, the mapping of field names to the actual input keys used.
         """
         index = index if self.opts.index_errors else None
         if many:
             if not is_sequence_but_not_string(data):
                 error_store.store_error([self.error_messages["type"]], index=index)
-                ret_l = []
+                return [], []
             else:
-                ret_l = [
-                    self._deserialize(
-                        d,
+                ret_l, load_keys_l = [], []
+                for idx, item in enumerate(data):
+                    item_data, item_load_keys = self._deserialize(
+                        item,
                         error_store=error_store,
                         many=False,
                         partial=partial,
                         unknown=unknown,
                         index=idx,
                     )
-                    for idx, d in enumerate(data)
-                ]
-            return ret_l
+                    ret_l.append(item_data)
+                    load_keys_l.append(item_load_keys)
+                return ret_l, load_keys_l
         ret_d = self.dict_class()
         # Check data is a dict
         if not isinstance(data, Mapping):
             error_store.store_error([self.error_messages["type"]], index=index)
+            return ret_d, {}
         else:
+            load_keys, ambiguous, consumed = self._resolve_alias_keys(data)
             partial_is_collection = is_collection(partial)
             for attr_name, field_obj in self.load_fields.items():
-                field_name = (
+                primary_key = (
                     field_obj.data_key if field_obj.data_key is not None else attr_name
                 )
-                raw_value = data.get(field_name, missing)
+                field_name = load_keys.get(attr_name, primary_key)
+                if attr_name in ambiguous:
+                    error = field_obj.make_error(
+                        "ambiguous", input_keys=ambiguous[attr_name]
+                    )
+                    error_store.store_error(
+                        error.messages,
+                        primary_key,
+                        index=index,
+                    )
+                    continue
+                raw_value = data[field_name] if attr_name in load_keys else missing
                 if raw_value is missing:
                     # Ignore missing field if we're allowed to.
                     if partial is True or (
@@ -688,11 +707,7 @@ class Schema(metaclass=SchemaMeta):
                     key = field_obj.attribute or attr_name
                     set_value(ret_d, key, value)
             if unknown != EXCLUDE:
-                fields = {
-                    field_obj.data_key if field_obj.data_key is not None else field_name
-                    for field_name, field_obj in self.load_fields.items()
-                }
-                for key in set(data) - fields:
+                for key in set(data) - consumed:
                     value = data[key]
                     if unknown == INCLUDE:
                         ret_d[key] = value
@@ -702,7 +717,37 @@ class Schema(metaclass=SchemaMeta):
                             key,
                             index,
                         )
-        return ret_d
+        return ret_d, load_keys
+
+    def _resolve_alias_keys(
+        self, data: Mapping[str, typing.Any]
+    ) -> tuple[dict[str, str], dict[str, list[str]], set[str]]:
+        """Resolve the load input keys of a single mapping.
+
+        Returns a tuple ``(load_keys, ambiguous, consumed)``:
+
+        - ``load_keys`` maps the field name to the actual key under which it
+          was provided in the input (primary name or a ``load_alias``);
+        - ``ambiguous`` maps the field name to the list of conflicting input
+          keys when the same field was provided more than once;
+        - ``consumed`` is the set of input keys that matched a loadable field,
+          which must not be treated as unknown fields.
+        """
+        load_keys: dict[str, str] = {}
+        ambiguous: dict[str, list[str]] = {}
+        consumed: set[str] = set()
+        for input_key in data:
+            field_name = self._load_alias_index.get(input_key)
+            if field_name is None:
+                continue
+            consumed.add(input_key)
+            if field_name in load_keys:
+                ambiguous.setdefault(
+                    field_name, [load_keys[field_name]]
+                ).append(input_key)
+            else:
+                load_keys[field_name] = input_key
+        return load_keys, ambiguous, consumed
 
     def load(
         self,
@@ -781,6 +826,7 @@ class Schema(metaclass=SchemaMeta):
         partial: bool | types.StrSequenceOrSet | None,
         unknown: types.UnknownOption | None,
         pass_original: bool,
+        load_keys: dict[str, str] | None = None,
         index: int | None = None,
     ):
         try:
@@ -808,6 +854,8 @@ class Schema(metaclass=SchemaMeta):
                         if field_obj.data_key is not None
                         else field_name
                     )
+                    if load_keys:
+                        data_key = load_keys.get(field_name, data_key)
                 else:
                     data_key = field_name
             error_store.store_error(err.messages, data_key, index=index)
@@ -888,7 +936,7 @@ class Schema(metaclass=SchemaMeta):
             processed_data = data
         if not errors:
             # Deserialize data
-            result = self._deserialize(
+            result, load_keys = self._deserialize(
                 processed_data,
                 error_store=error_store,
                 many=many,
@@ -897,7 +945,7 @@ class Schema(metaclass=SchemaMeta):
             )
             # Run field-level validation
             self._invoke_field_validators(
-                error_store=error_store, data=result, many=many
+                error_store=error_store, data=result, many=many, load_keys=load_keys
             )
             # Run schema-level validation
             if self._hooks[VALIDATES_SCHEMA]:
@@ -910,6 +958,7 @@ class Schema(metaclass=SchemaMeta):
                     many=many,
                     partial=partial,
                     unknown=unknown,
+                    load_keys=load_keys,
                     field_errors=field_errors,
                 )
                 self._invoke_schema_validators(
@@ -920,6 +969,7 @@ class Schema(metaclass=SchemaMeta):
                     many=many,
                     partial=partial,
                     unknown=unknown,
+                    load_keys=load_keys,
                     field_errors=field_errors,
                 )
             errors = error_store.errors
@@ -1048,9 +1098,48 @@ class Schema(metaclass=SchemaMeta):
                 f"attribute arguments: {list(attributes_duplicates)}"
             )
 
+        self._load_alias_index = self._build_load_alias_index(load_fields)
         self.fields = fields_dict
         self.dump_fields = dump_fields
         self.load_fields = load_fields
+
+    def _build_load_alias_index(
+        self, load_fields: dict[str, Field]
+    ) -> dict[str, str]:
+        """Build a mapping of every accepted load input key to its field name.
+
+        The primary load name of a field is its ``data_key`` or, when that is
+        unset, its attribute name. Each of the field's ``load_aliases`` is
+        added as an extra accepted key. An alias that is already used as
+        another field's primary load name or that is declared on more than one
+        loadable field causes a ``ValueError``.
+        """
+        primary_keys = {
+            field_obj.data_key if field_obj.data_key is not None else field_name
+            for field_name, field_obj in load_fields.items()
+        }
+        alias_index: dict[str, str] = {}
+        collisions: set[str] = set()
+        for field_name, field_obj in load_fields.items():
+            primary_key = (
+                field_obj.data_key if field_obj.data_key is not None else field_name
+            )
+            alias_index[primary_key] = field_name
+            for alias in field_obj.load_aliases:
+                if alias == primary_key:
+                    continue
+                if alias in primary_keys or alias in alias_index:
+                    collisions.add(alias)
+                else:
+                    alias_index[alias] = field_name
+        if collisions:
+            raise ValueError(
+                "The load_aliases argument for one or more fields collides "
+                "with another field's name or data_key argument. "
+                "Check the following load keys: "
+                f"{sorted(collisions)}"
+            )
+        return alias_index
 
     def on_bind_field(self, field_name: str, field_obj: Field) -> None:
         """Hook to modify a field when it is bound to the `Schema <marshmallow.Schema>`.
@@ -1121,7 +1210,14 @@ class Schema(metaclass=SchemaMeta):
             unknown=unknown,
         )
 
-    def _invoke_field_validators(self, *, error_store: ErrorStore, data, many: bool):
+    def _invoke_field_validators(
+        self,
+        *,
+        error_store: ErrorStore,
+        data,
+        many: bool,
+        load_keys: list[dict[str, str]] | dict[str, str] | None = None,
+    ):
         for attr_name, _, validator_kwargs in self._hooks[VALIDATES]:
             validator = getattr(self, attr_name)
 
@@ -1138,8 +1234,6 @@ class Schema(metaclass=SchemaMeta):
                 data_key = (
                     field_obj.data_key if field_obj.data_key is not None else field_name
                 )
-                do_validate = functools.partial(validator, data_key=data_key)
-
                 if many:
                     for idx, item in enumerate(data):
                         try:
@@ -1147,16 +1241,30 @@ class Schema(metaclass=SchemaMeta):
                         except KeyError:
                             pass
                         else:
+                            item_data_key = data_key
+                            if load_keys and idx < len(load_keys):
+                                item_data_key = load_keys[idx].get(
+                                    field_name, data_key
+                                )
+                            do_validate = functools.partial(
+                                validator, data_key=item_data_key
+                            )
                             validated_value = self._call_and_store(
                                 getter_func=do_validate,
                                 data=value,
-                                field_name=data_key,
+                                field_name=item_data_key,
                                 error_store=error_store,
                                 index=(idx if self.opts.index_errors else None),
                             )
                             if validated_value is missing:
                                 item.pop(field_name, None)
                 else:
+                    item_data_key = data_key
+                    if load_keys:
+                        item_data_key = load_keys.get(field_name, data_key)
+                    do_validate = functools.partial(
+                        validator, data_key=item_data_key
+                    )
                     try:
                         value = data[field_obj.attribute or field_name]
                     except KeyError:
@@ -1165,7 +1273,7 @@ class Schema(metaclass=SchemaMeta):
                         validated_value = self._call_and_store(
                             getter_func=do_validate,
                             data=value,
-                            field_name=data_key,
+                            field_name=item_data_key,
                             error_store=error_store,
                         )
                         if validated_value is missing:
@@ -1180,8 +1288,9 @@ class Schema(metaclass=SchemaMeta):
         original_data,
         many: bool,
         partial: bool | types.StrSequenceOrSet | None,
-        field_errors: bool = False,
         unknown: types.UnknownOption | None,
+        field_errors: bool = False,
+        load_keys: list[dict[str, str]] | dict[str, str] | None = None,
     ):
         for attr_name, hook_many, validator_kwargs in self._hooks[VALIDATES_SCHEMA]:
             if hook_many != pass_collection:
@@ -1195,6 +1304,9 @@ class Schema(metaclass=SchemaMeta):
                 for idx, (item, orig) in enumerate(
                     zip(data, original_data, strict=True)
                 ):
+                    item_load_keys = None
+                    if load_keys and idx < len(load_keys):
+                        item_load_keys = load_keys[idx]
                     self._run_validator(
                         validator,
                         item,
@@ -1205,6 +1317,7 @@ class Schema(metaclass=SchemaMeta):
                         unknown=unknown,
                         index=idx,
                         pass_original=pass_original,
+                        load_keys=item_load_keys,
                     )
             else:
                 self._run_validator(
@@ -1216,6 +1329,7 @@ class Schema(metaclass=SchemaMeta):
                     pass_original=pass_original,
                     partial=partial,
                     unknown=unknown,
+                    load_keys=None if many else load_keys,
                 )
 
     def _invoke_processors(

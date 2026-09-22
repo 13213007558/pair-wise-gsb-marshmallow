@@ -6,6 +6,13 @@ Changelog
 
 Features:
 
+- Add ``load_aliases`` parameter to `marshmallow.fields.Field`:
+  fields accept extra input keys on load while dumping keeps using the
+  primary ``data_key``. Providing the same field under multiple accepted
+  keys in one payload raises a validation error listing the conflicting
+  input keys. Aliases that collide with another loadable field's primary
+  name or that are shared by two fields raise a ``ValueError`` when the
+  `Schema <marshmallow.Schema>` is bound.
 - Simplify `get_value` to match actual usage (:pr:`3024`).
 
 Bug fixes:
