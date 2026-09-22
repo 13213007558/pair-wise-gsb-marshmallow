@@ -78,6 +78,7 @@ __all__ = [
     "Time",
     "TimeDelta",
     "Tuple",
+    "Union",
     "Url",
 ]
 
@@ -729,6 +730,278 @@ class Pluck(Nested):
         return self._load(value, partial=partial)
 
 
+class Union(Field):
+    """Select one of several schemas based on a discriminator field.
+
+    Example: ::
+
+        class CreatedSchema(Schema):
+            kind = fields.Constant("created")
+            name = fields.Str()
+
+
+        class UpdatedSchema(Schema):
+            kind = fields.Constant("updated")
+            name = fields.Str()
+
+
+        class WebhookSchema(Schema):
+            event = fields.Union(
+                "kind",
+                {"created": CreatedSchema, "updated": UpdatedSchema},
+            )
+
+    The selected schema is resolved once from the discriminator value. Schema
+    references may be callables, allowing recursive schemas to reference
+    themselves.
+    """
+
+    default_error_messages = {
+        "type": "Invalid type.",
+        "required": "Missing data for required field.",
+        "invalid_choice": "Not a valid choice.",
+    }
+
+    def __init__(
+        self,
+        discriminator: str,
+        schemas: typing.Mapping[
+            typing.Hashable,
+            Schema
+            | SchemaMeta
+            | str
+            | dict[str, Field]
+            | typing.Callable[[], Schema | SchemaMeta | str | dict[str, Field]],
+        ],
+        *,
+        only: types.StrSequenceOrSet | None = None,
+        exclude: types.StrSequenceOrSet = (),
+        many: bool = False,
+        unknown: types.UnknownOption | None = None,
+        **kwargs: Unpack[_BaseFieldKwargs],
+    ):
+        if not isinstance(discriminator, str):
+            raise ValueError("`discriminator` must be a string.")
+        if not isinstance(schemas, _Mapping) or not schemas:
+            raise ValueError("`schemas` must be a non-empty mapping.")
+        if only is not None and not utils.is_sequence_but_not_string(only):
+            raise StringNotCollectionError('"only" should be a collection of strings.')
+        if not utils.is_sequence_but_not_string(exclude):
+            raise StringNotCollectionError(
+                '"exclude" should be a collection of strings.'
+            )
+
+        self.discriminator = discriminator
+        self.schemas = dict(schemas)
+        self.only = only
+        self.exclude = exclude
+        self.many = many
+        self.unknown = unknown
+        self._schema_cache: dict[typing.Hashable, Schema] = {}
+        super().__init__(**kwargs)
+        for value, nested in self.schemas.items():
+            if isinstance(nested, (str, bytes)) or (
+                callable(nested) and not isinstance(nested, type)
+            ):
+                continue
+            self._resolve_schema(value)
+
+    def _bind_to_schema(self, field_name: str, parent: Schema | Field) -> None:
+        self._schema_cache = {}
+        super()._bind_to_schema(field_name, parent)
+
+    def _resolve_schema(self, value: typing.Hashable) -> Schema:
+        try:
+            return self._schema_cache[value]
+        except KeyError:
+            pass
+
+        from marshmallow.schema import Schema, SchemaMeta  # noqa: PLC0415
+
+        nested = self.schemas[value]
+        if callable(nested) and not isinstance(nested, SchemaMeta):
+            nested = nested()
+
+        if isinstance(nested, dict):
+            nested = Schema.from_dict(nested)
+
+        if isinstance(nested, type) and issubclass(nested, Schema):
+            schema = nested(only=self.only, exclude=self.exclude)
+        elif isinstance(nested, (str, bytes)):
+            schema_class = class_registry.get_class(nested, all=False)
+            schema = schema_class(only=self.only, exclude=self.exclude)
+        elif isinstance(nested, Schema):
+            schema = copy.deepcopy(nested)
+            schema.fields = {}
+            schema.load_fields = {}
+            schema.dump_fields = {}
+            if self.only is not None or self.exclude:
+                set_class = typing.cast("type[set]", schema.set_class)
+                if self.only is not None:
+                    original = (
+                        schema.only
+                        if schema.only is not None
+                        else schema.declared_fields.keys()
+                    )
+                    schema.only = set_class(self.only) & set_class(original)
+                if self.exclude:
+                    schema.exclude = set_class(self.exclude) | set_class(schema.exclude)
+            schema._init_fields()
+        else:
+            raise ValueError(
+                "`Union` schemas must be a `Schema`, schema class, schema name, "
+                f"dictionary, or callable, not {nested.__class__}."
+            )
+
+        self._validate_schema(schema, value)
+        if schema.many:
+            raise ValueError("`Union` schemas must not be configured with `many`.")
+        self._schema_cache[value] = schema
+        return schema
+
+    def _discriminator_field_name(self, schema: Schema) -> str:
+        for field_name, field_obj in schema.declared_fields.items():
+            field_data_key = (
+                field_obj.data_key if field_obj.data_key is not None else field_name
+            )
+            if field_data_key == self.discriminator:
+                return field_name
+        raise ValueError(
+            f"Schema {schema.__class__.__name__} must declare a field with "
+            f"data key {self.discriminator!r}."
+        )
+
+    def _validate_schema(self, schema: Schema, value: typing.Hashable) -> None:
+        field_name = self._discriminator_field_name(schema)
+        field = schema.declared_fields[field_name]
+        if isinstance(field, Constant) and field.constant != value:
+            raise ValueError(
+                f"Discriminator field {self.discriminator!r} of "
+                f"{schema.__class__.__name__} must be {value!r}."
+            )
+
+    def _get_discriminator_value(self, data: typing.Any) -> typing.Any:
+        if not isinstance(data, _Mapping):
+            raise ValidationError(
+                {self.discriminator: [self.error_messages["type"]]},
+                valid_data={},
+            )
+        try:
+            value = data[self.discriminator]
+        except (KeyError, TypeError):
+            raise ValidationError(
+                {self.discriminator: [self.error_messages["required"]]},
+                valid_data={},
+            ) from None
+        try:
+            is_known_value = value in self.schemas
+        except TypeError:
+            is_known_value = False
+        if not is_known_value:
+            raise ValidationError(
+                {self.discriminator: [self.error_messages["invalid_choice"]]},
+                valid_data={},
+            )
+        return value
+
+    def _load(
+        self,
+        value: typing.Any,
+        partial: bool | types.StrSequenceOrSet | None = None,  # noqa: FBT001
+    ) -> typing.Any:
+        if self.many:
+            if not utils.is_collection(value):
+                raise self.make_error(
+                    "type", input=value, type=value.__class__.__name__
+                )
+
+            result = []
+            errors = {}
+            for index, item in enumerate(value):
+                try:
+                    result.append(self._load_one(item, partial=partial))
+                except ValidationError as error:
+                    if error.valid_data is not None:
+                        result.append(error.valid_data)
+                    errors[index] = error.messages
+            if errors:
+                raise ValidationError(errors, valid_data=result)
+            return result
+        return self._load_one(value, partial=partial)
+
+    def _load_one(
+        self,
+        value: typing.Any,
+        partial: bool | types.StrSequenceOrSet | None = None,  # noqa: FBT001
+    ) -> typing.Any:
+        discriminator_value = self._get_discriminator_value(value)
+        schema = self._resolve_schema(discriminator_value)
+        return schema.load(value, unknown=self.unknown, partial=partial)
+
+    def _serialize(self, value, attr, obj, **kwargs):
+        if value is None:
+            return None
+        if self.many:
+            if not utils.is_collection(value):
+                raise self.make_error(
+                    "type", input=value, type=value.__class__.__name__
+                )
+            return [self._serialize_one(item) for item in value]
+        return self._serialize_one(value)
+
+    def _serialize_one(self, value: typing.Any) -> typing.Any:
+        discriminator_value = self._get_dump_discriminator_value(value)
+        schema = self._resolve_schema(discriminator_value)
+        serialized = schema.dump(value)
+        serialized_value = serialized.get(self.discriminator, missing_)
+        if serialized_value is not missing_ and serialized_value != discriminator_value:
+            raise ValidationError(
+                {
+                    self.discriminator: [
+                        f"Must be {discriminator_value!r}, got {serialized_value!r}."
+                    ]
+                }
+            )
+        return serialized
+
+    def _get_dump_discriminator_value(self, value: typing.Any) -> typing.Any:
+        candidates = []
+        for discriminator_value in self.schemas:
+            schema = self._resolve_schema(discriminator_value)
+            field_name = self._discriminator_field_name(schema)
+            field = schema.declared_fields[field_name]
+            attribute_name = field.attribute or field_name
+            candidates.append(
+                (discriminator_value, utils.get_value(value, attribute_name, missing_))
+            )
+
+        matching = [item for item in candidates if item[1] is not missing_]
+        if not matching:
+            raise ValidationError(
+                {self.discriminator: [self.error_messages["required"]]}
+            )
+        if len({item[1] for item in matching}) > 1:
+            raise ValidationError(
+                {self.discriminator: ["Conflicting discriminator values."]}
+            )
+        actual_value = matching[0][1]
+        if actual_value not in self.schemas:
+            raise ValidationError(
+                {self.discriminator: [self.error_messages["invalid_choice"]]}
+            )
+        return actual_value
+
+    def _deserialize(
+        self,
+        value: typing.Any,
+        attr: str | None,
+        data: typing.Mapping[str, typing.Any] | None,
+        partial: bool | types.StrSequenceOrSet | None = None,  # noqa: FBT001
+        **kwargs,
+    ):
+        return self._load(value, partial=partial)
+
+
 class List(Field[list[_InternalT | None]]):
     """A list field, composed with another `Field` class or
     instance.
@@ -760,7 +1033,7 @@ class List(Field[list[_InternalT | None]]):
                 "The list elements must be a subclass or instance of "
                 "marshmallow.fields.Field."
             ) from error
-        if isinstance(self.inner, Nested):
+        if isinstance(self.inner, Nested | Union):
             self.only = self.inner.only
             self.exclude = self.inner.exclude
 
@@ -768,7 +1041,7 @@ class List(Field[list[_InternalT | None]]):
         super()._bind_to_schema(field_name, parent)
         self.inner = copy.deepcopy(self.inner)
         self.inner._bind_to_schema(field_name, self)
-        if isinstance(self.inner, Nested):
+        if isinstance(self.inner, Nested | Union):
             self.inner.only = self.only
             self.inner.exclude = self.exclude
 
