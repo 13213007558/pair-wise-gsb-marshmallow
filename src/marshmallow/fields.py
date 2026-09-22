@@ -52,6 +52,7 @@ __all__ = [
     "Date",
     "DateTime",
     "Decimal",
+    "Derived",
     "Dict",
     "Email",
     "Enum",
@@ -2143,6 +2144,97 @@ class Constant(Field[_ContantT]):
 
     def _deserialize(self, value, *args, **kwargs) -> _ContantT:
         return self.constant
+
+
+class Derived(Field):
+    """A field whose value is computed from other deserialized fields.
+
+    ``Derived`` fields are never populated from the input data: clients cannot
+    submit a value for them. After all ordinary fields have been deserialized
+    and run their field-level validators, each ``Derived`` field is computed
+    exactly once, in an order derived from its dependencies. The resulting
+    value then goes through the field's own validators, like any other field.
+
+    Computation happens before schema-level validators and ``post_load``
+    processors, so object-level validation sees the fully derived result.
+
+    :param compute: Callable producing the field's value. By default it is
+        called with the resolved dependency values as keyword arguments, using
+        the last segment of each dependency path::
+
+            subtotal = fields.Derived(
+                lambda unit_price, quantity: unit_price * quantity,
+                "unit_price",
+                "quantity",
+            )
+
+        If the callable takes a single positional-only argument, or an argument
+        named ``values`` (``data``, ``items``, ``context`` and ``fields`` also
+        work), it is instead called with a read-only mapping of every value
+        computed so far::
+
+            total = fields.Derived(
+                lambda values: values["a"] + values["b"], "a", "b"
+            )
+    :param dependencies: Internal field paths (using ``attribute`` if set,
+        otherwise the field name) of the fields this one depends on. Dotted
+        paths and dependencies on other ``Derived`` fields are supported.
+    :param depends_on: Keyword-only alias for ``dependencies``.
+
+    .. versionadded:: 4.0.0
+    """
+
+    def __init__(
+        self,
+        compute: typing.Callable[..., typing.Any],
+        *dependencies: str,
+        depends_on: typing.Sequence[str] | None = None,
+        **kwargs: Unpack[_BaseFieldKwargs],
+    ):
+        if depends_on is None:
+            dep_list = list(dependencies)
+        else:
+            if dependencies:
+                raise ValueError(
+                    "Pass dependencies either positionally or via `depends_on`, not both."
+                )
+            if utils.is_iterable_but_not_string(depends_on):
+                dep_list = list(depends_on)
+            else:
+                raise StringNotCollectionError(
+                    '"depends_on" should be a collection of strings.'
+                )
+        for dep in dep_list:
+            if not isinstance(dep, str) or not dep:
+                raise ValueError("Derived dependencies must be non-empty strings.")
+            if dep != dep.strip(".") or "" in dep.split("."):
+                raise ValueError(f"Invalid dependency path: {dep!r}.")
+        kwargs["required"] = False
+        kwargs.setdefault("dump_only", False)
+        super().__init__(**kwargs)
+        self.compute = utils.callable_or_raise(compute)
+        self.dependencies: tuple[str, ...] = tuple(dep_list)
+
+    def _serialize(self, value, attr, obj, **kwargs):
+        return value
+
+
+def get_nested_value(obj: typing.Any, path: str) -> typing.Any:
+    """Return the value at a dot-delimited internal ``path``.
+
+    Missing containers or keys result in the :data:`missing <marshmallow.missing>`
+    sentinel instead of raising.
+    """
+    current = obj
+    for key in path.split("."):
+        try:
+            current = current[key]
+        except (KeyError, IndexError, TypeError):
+            try:
+                current = getattr(current, key)
+            except AttributeError:
+                return missing_
+    return current
 
 
 # Aliases

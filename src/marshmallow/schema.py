@@ -603,6 +603,7 @@ class Schema(metaclass=SchemaMeta):
         partial=None,
         unknown: types.UnknownOption = RAISE,
         index=None,
+        baseline: typing.Any = None,
     ) -> typing.Any | list[typing.Any]:
         """Deserialize ``data``.
 
@@ -626,6 +627,11 @@ class Schema(metaclass=SchemaMeta):
                 error_store.store_error([self.error_messages["type"]], index=index)
                 ret_l = []
             else:
+                if baseline is not None and not is_sequence_but_not_string(baseline):
+                    raise TypeError(
+                        "When loading many items, `baseline` must be a sequence of "
+                        "deserialized values matching the input items."
+                    )
                 ret_l = [
                     self._deserialize(
                         d,
@@ -634,6 +640,11 @@ class Schema(metaclass=SchemaMeta):
                         partial=partial,
                         unknown=unknown,
                         index=idx,
+                        baseline=(
+                            baseline[idx]
+                            if baseline is not None and idx < len(baseline)
+                            else None
+                        ),
                     )
                     for idx, d in enumerate(data)
                 ]
@@ -645,6 +656,10 @@ class Schema(metaclass=SchemaMeta):
         else:
             partial_is_collection = is_collection(partial)
             for attr_name, field_obj in self.load_fields.items():
+                if isinstance(field_obj, ma_fields.Derived):
+                    # Derived values are computed after ordinary field
+                    # deserialization and field-level validation.
+                    continue
                 field_name = (
                     field_obj.data_key if field_obj.data_key is not None else attr_name
                 )
@@ -691,8 +706,18 @@ class Schema(metaclass=SchemaMeta):
                 fields = {
                     field_obj.data_key if field_obj.data_key is not None else field_name
                     for field_name, field_obj in self.load_fields.items()
+                    if not isinstance(field_obj, ma_fields.Derived)
                 }
-                for key in set(data) - fields:
+                # Derived fields never accept client input: submitted keys are
+                # dropped silently (unless another declared field claims them).
+                derived_input_keys = {
+                    field_obj.data_key
+                    if field_obj.data_key is not None
+                    else field_name
+                    for field_name, field_obj in self.load_fields.items()
+                    if isinstance(field_obj, ma_fields.Derived)
+                }
+                for key in set(data) - fields - derived_input_keys:
                     value = data[key]
                     if unknown == INCLUDE:
                         ret_d[key] = value
@@ -711,6 +736,7 @@ class Schema(metaclass=SchemaMeta):
         many: bool | None = None,
         partial: bool | types.StrSequenceOrSet | None = None,
         unknown: types.UnknownOption | None = None,
+        baseline: typing.Mapping[str, typing.Any] | typing.Sequence | None = None,
     ):
         """Deserialize a data structure to an object defined by this Schema's fields.
 
@@ -732,7 +758,12 @@ class Schema(metaclass=SchemaMeta):
             if invalid data are passed.
         """
         return self._do_load(
-            data, many=many, partial=partial, unknown=unknown, postprocess=True
+            data,
+            many=many,
+            partial=partial,
+            unknown=unknown,
+            postprocess=True,
+            baseline=baseline,
         )
 
     def loads(
@@ -767,8 +798,15 @@ class Schema(metaclass=SchemaMeta):
         .. versionchanged:: 4.0.0
             Rename ``json_module`` parameter to ``s``.
         """
+        baseline = kwargs.pop("baseline", None)
         data = self.opts.render_module.loads(s, **kwargs)
-        return self.load(data, many=many, partial=partial, unknown=unknown)
+        return self.load(
+            data,
+            many=many,
+            partial=partial,
+            unknown=unknown,
+            baseline=baseline,
+        )
 
     def _run_validator(
         self,
@@ -818,6 +856,7 @@ class Schema(metaclass=SchemaMeta):
         *,
         many: bool | None = None,
         partial: bool | types.StrSequenceOrSet | None = None,
+        baseline: typing.Mapping[str, typing.Any] | typing.Sequence | None = None,
     ) -> dict[str, list[str]]:
         """Validate `data` against the schema, returning a dictionary of
         validation errors.
@@ -832,7 +871,13 @@ class Schema(metaclass=SchemaMeta):
         :return: A dictionary of validation errors.
         """
         try:
-            self._do_load(data, many=many, partial=partial, postprocess=False)
+            self._do_load(
+                data,
+                many=many,
+                partial=partial,
+                postprocess=False,
+                baseline=baseline,
+            )
         except ValidationError as exc:
             return typing.cast("dict[str, list[str]]", exc.messages)
         return {}
@@ -847,6 +892,7 @@ class Schema(metaclass=SchemaMeta):
         partial: bool | types.StrSequenceOrSet | None = None,
         unknown: types.UnknownOption | None = None,
         postprocess: bool = True,
+        baseline: typing.Mapping[str, typing.Any] | typing.Sequence | None = None,
     ):
         """Deserialize `data`, returning the deserialized result.
         This method is private API.
@@ -894,10 +940,11 @@ class Schema(metaclass=SchemaMeta):
                 many=many,
                 partial=partial,
                 unknown=unknown,
+                baseline=baseline,
             )
             # Run field-level validation
             self._invoke_field_validators(
-                error_store=error_store, data=result, many=many
+                error_store=error_store, data=result, many=many, baseline=baseline
             )
             # Run schema-level validation
             if self._hooks[VALIDATES_SCHEMA]:
@@ -1051,6 +1098,15 @@ class Schema(metaclass=SchemaMeta):
         self.fields = fields_dict
         self.dump_fields = dump_fields
         self.load_fields = load_fields
+        self.derived_order: list[str] = self._resolve_derived_fields()
+        self._derived_validators: dict[str, list[typing.Callable]] = defaultdict(list)
+        for hook_attr_name, _, validator_kwargs in self._hooks[VALIDATES]:
+            for field_name in validator_kwargs["field_names"]:
+                field_obj = self.fields.get(field_name)
+                if isinstance(field_obj, ma_fields.Derived):
+                    self._derived_validators[field_name].append(
+                        getattr(self, hook_attr_name)
+                    )
 
     def on_bind_field(self, field_name: str, field_obj: Field) -> None:
         """Hook to modify a field when it is bound to the `Schema <marshmallow.Schema>`.
@@ -1072,6 +1128,345 @@ class Schema(metaclass=SchemaMeta):
             field_obj.dump_only = True
         field_obj._bind_to_schema(field_name, self)
         self.on_bind_field(field_name, field_obj)
+
+    def _resolve_derived_fields(self) -> list[str]:
+        """Validate the dependency graph of `Derived` fields and return the
+        derived field names in dependency-first execution order.
+
+        Unknown dependencies and dependency cycles raise `ValueError` while
+        the schema is being bound, naming the concrete offending path.
+        """
+        # Both the declared field name and its internal attribute resolve to
+        # the field, so dependencies can be written either way. Values are
+        # always read from the internal (post-deserialization) data.
+        internal_paths: dict[str, tuple[str, Field]] = {}
+        for field_name, field_obj in self.fields.items():
+            internal_paths[field_name] = (field_name, field_obj)
+            internal_paths[field_obj.attribute or field_name] = (field_name, field_obj)
+
+        derived: dict[str, ma_fields.Derived] = {
+            field_name: field_obj
+            for field_name, field_obj in self.load_fields.items()
+            if isinstance(field_obj, ma_fields.Derived)
+        }
+
+        # Resolve each declared dependency to the internal path of a selected
+        # field and decide how the compute callable receives its arguments.
+        resolved_deps: dict[str, list[str]] = {}
+        for field_name, derived_obj in derived.items():
+            deps: list[str] = []
+            for dep in derived_obj.dependencies:
+                root = dep.split(".", 1)[0]
+                if root not in internal_paths:
+                    raise ValueError(
+                        f'Derived field "{field_name}" depends on unknown path '
+                        f'"{dep}": no field named "{root}" on {self}.'
+                    )
+                target_name, target_obj = internal_paths[root]
+                if isinstance(target_obj, ma_fields.Derived) and target_name not in derived:
+                    raise ValueError(
+                        f'Derived field "{field_name}" depends on non-loaded '
+                        f'Derived field "{target_name}" via path "{dep}".'
+                    )
+                if target_obj.dump_only and not isinstance(target_obj, ma_fields.Derived):
+                    raise ValueError(
+                        f'Derived field "{field_name}" depends on dump-only field '
+                        f'"{target_name}" via path "{dep}".'
+                    )
+                deps.append(
+                    dep.replace(root, target_obj.attribute or target_name, 1)
+                )
+            derived_obj._resolved_dependencies = tuple(deps)
+            derived_obj._compute_call_plan = self._plan_derived_compute(
+                field_name, derived_obj, internal_paths
+            )
+            resolved_deps[field_name] = deps
+
+        # Stable topological sort: declaration order is preserved for fields
+        # that do not depend on each other.
+        order: list[str] = []
+        state: dict[str, str] = {}
+
+        def visit(node: str, chain: list[str]) -> None:
+            status = state.get(node)
+            if status == "done":
+                return
+            if status == "visiting":
+                cycle = chain[chain.index(node) :] + [node]
+                cycle_paths = " -> ".join(cycle)
+                raise ValueError(
+                    f"Circular dependency between Derived fields: {cycle_paths}."
+                )
+            state[node] = "visiting"
+            chain.append(node)
+            for dep in resolved_deps[node]:
+                dep_name = dep.split(".", 1)[0]
+                if dep_name in derived:
+                    visit(dep_name, chain)
+            chain.pop()
+            state[node] = "done"
+            order.append(node)
+
+        for field_name in derived:
+            visit(field_name, [])
+        return order
+
+    def _plan_derived_compute(
+        self,
+        field_name: str,
+        derived_obj: ma_fields.Derived,
+        internal_paths: dict[str, tuple[str, Field]],
+    ) -> dict[str, typing.Any]:
+        """Pre-resolve, at bind time, how ``compute`` is invoked at load time.
+
+        The callable is invoked either with the full accumulated mapping as a
+        single positional argument, or with each dependency as a keyword
+        argument named after the dependency path's last segment.
+        """
+        deps = list(derived_obj._resolved_dependencies)
+        leaf_names = [dep.rsplit(".", 1)[-1] for dep in deps]
+        try:
+            sig = inspect.signature(derived_obj.compute)
+        except (TypeError, ValueError):
+            sig = None
+
+        has_var_keyword = sig is not None and any(
+            param.kind is inspect.Parameter.VAR_KEYWORD
+            for param in sig.parameters.values()
+        )
+        named_params: set[str] = set()
+        positional_count = 0
+        positional_only_required = 0
+        if sig is not None:
+            for param in sig.parameters.values():
+                if param.kind in (
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                ):
+                    named_params.add(param.name)
+                if param.kind in (
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                ):
+                    positional_count += 1
+                    if (
+                        param.kind is inspect.Parameter.POSITIONAL_ONLY
+                        and param.default is inspect.Parameter.empty
+                    ):
+                        positional_only_required += 1
+
+        duplicates = {name for name in leaf_names if leaf_names.count(name) > 1}
+        if duplicates and positional_count != 1:
+            raise ValueError(
+                f'Derived field "{field_name}" has dependencies whose path leaf '
+                f"names collide: {sorted(duplicates)}. Its compute callable must "
+                "accept a single mapping argument."
+            )
+
+        # Mapping mode is only selected explicitly: the single parameter is
+        # positional-only or uses one of the conventional mapping names.
+        # Otherwise each dependency is passed as a keyword argument named after
+        # the last segment of its path, so a single dependency lambda
+        # ``lambda a: ...`` is unambiguous.
+        MAPPING_PARAM_NAMES = {"values", "data", "items", "context", "fields"}
+        mapping_mode = False
+        if positional_count == 1 and sig is not None:
+            single_param = next(
+                param
+                for param in sig.parameters.values()
+                if param.kind
+                in (
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                )
+            )
+            if (
+                single_param.kind is inspect.Parameter.POSITIONAL_ONLY
+                or single_param.name in MAPPING_PARAM_NAMES
+            ):
+                mapping_mode = True
+
+        return {
+            "mapping_mode": mapping_mode,
+            "leaf_names": leaf_names,
+        }
+
+    @staticmethod
+    def _failed_field_paths(error_store: ErrorStore, *, index: int | None) -> set[str]:
+        """Return the internal field paths that currently carry errors.
+
+        Only the roots of error paths are needed because a dependency on a
+        nested value always has the failed field as its first segment.
+        Nested error mappings (lists/dicts) are traversed recursively.
+        """
+        errors: typing.Any = error_store.errors
+        if index is not None:
+            errors = errors.get(index) if isinstance(errors, dict) else None
+        if not isinstance(errors, dict):
+            return set()
+
+        def walk(node: typing.Any, prefix: tuple[str, ...]) -> None:
+            if isinstance(node, dict):
+                for key, val in node.items():
+                    if key == SCHEMA:
+                        continue
+                    walk(val, (*prefix, str(key)))
+            else:
+                failed.add(".".join(prefix))
+
+        failed: set[str] = set()
+        walk(errors, ())
+        return failed
+
+    @staticmethod
+    def _data_key_to_attribute(data_key: str, load_fields: dict) -> str | None:
+        for field_name, field_obj in load_fields.items():
+            field_data_key = (
+                field_obj.data_key if field_obj.data_key is not None else field_name
+            )
+            if field_data_key == data_key:
+                return field_obj.attribute or field_name
+        return None
+
+    def _compute_derived_fields(
+        self,
+        ret_d: dict,
+        *,
+        error_store: ErrorStore,
+        index: int | None,
+        baseline: typing.Mapping[str, typing.Any] | None,
+    ) -> None:
+        """Compute every ready `Derived` field exactly once, in dependency
+        order, and run its field-level validators.
+
+        Fields whose dependencies are unavailable (a dependency failed or is
+        omitted during partial loading) are skipped silently; independent
+        branches still run. Errors from already-failed fields are never
+        overwritten, since the error store merges instead of replacing.
+        """
+        if not self.derived_order:
+            return
+        if baseline is not None and not isinstance(baseline, Mapping):
+            raise TypeError("`baseline` must be a mapping of deserialized values.")
+
+        def lookup(path: str) -> typing.Any:
+            value = ma_fields.get_nested_value(ret_d, path)
+            if value is missing and baseline is not None:
+                value = ma_fields.get_nested_value(baseline, path)
+            return value
+
+        failed = self._failed_field_paths(error_store, index=index)
+        for attr_name in self.derived_order:
+            field_obj = typing.cast(ma_fields.Derived, self.load_fields[attr_name])
+            output_key = field_obj.attribute or attr_name
+            dependencies: tuple[str, ...] = field_obj._resolved_dependencies
+            if output_key in failed or any(
+                dep.split(".", 1)[0] in failed for dep in dependencies
+            ):
+                failed.add(output_key)
+                continue
+            values: dict[str, typing.Any] = {}
+            ready = True
+            for dep in dependencies:
+                dep_value = lookup(dep)
+                if dep_value is missing:
+                    ready = False
+                    break
+                set_value(values, dep, dep_value)
+            if not ready:
+                # Missing dependency (typically during partial loading):
+                # omit this field without flagging an error.
+                continue
+            plan = field_obj._compute_call_plan
+            data_key = (
+                field_obj.data_key if field_obj.data_key is not None else attr_name
+            )
+            try:
+                if plan["mapping_mode"]:
+                    computed = field_obj.compute(
+                        self._DerivedView(ret_d, baseline)
+                    )
+                else:
+                    kwargs = {
+                        leaf: ma_fields.get_nested_value(values, dep)
+                        for dep, leaf in zip(
+                            dependencies, plan["leaf_names"], strict=True
+                        )
+                    }
+                    computed = field_obj.compute(**kwargs)
+                # pre_load/post_load callbacks, null checks and validators
+                # run here, so derived fields behave like ordinary fields.
+                computed = field_obj.deserialize(
+                    computed,
+                    field_obj.data_key if field_obj.data_key is not None else attr_name,
+                    ret_d,
+                )
+                if computed is missing:
+                    continue
+            except ValidationError as error:
+                data_key = (
+                    field_obj.data_key
+                    if field_obj.data_key is not None
+                    else attr_name
+                )
+                error_store.store_error(error.messages, data_key, index=index)
+                failed.add(output_key)
+                continue
+            set_value(ret_d, output_key, computed)
+            # Run any @validates hooks declared for this derived field, in
+            # hook registration order. A failing hook removes the value so
+            # downstream derived fields are skipped just as for a failed
+            # source field.
+            for validator in self._derived_validators.get(attr_name, ()):
+                validated_value = self._call_and_store(
+                    getter_func=functools.partial(
+                        validator, data_key=data_key
+                    ),
+                    data=computed,
+                    field_name=data_key,
+                    error_store=error_store,
+                    index=index,
+                )
+                if validated_value is missing:
+                    ret_d.pop(output_key, None)
+                    failed.add(output_key)
+                    break
+
+    class _DerivedView(Mapping):
+        """Read-only mapping over computed data plus the caller's baseline.
+
+        The baseline is exposed but never mutated. Keys are internal field
+        paths (``attribute`` if set, otherwise the field name).
+        """
+
+        def __init__(self, data: Mapping, baseline: Mapping | None):
+            self._data = data
+            self._baseline = baseline
+
+        def __getitem__(self, key):
+            value = ma_fields.get_nested_value(self._data, key)
+            if value is missing and self._baseline is not None:
+                value = ma_fields.get_nested_value(self._baseline, key)
+            if value is missing:
+                raise KeyError(key)
+            return value
+
+        def __iter__(self):
+            yield from self._data
+            if self._baseline is not None:
+                for key in self._baseline:
+                    if key not in self._data:
+                        yield key
+
+        def __len__(self):
+            return sum(1 for _ in self)
+
+        def __contains__(self, key) -> bool:
+            try:
+                self[key]
+            except KeyError:
+                return False
+            return True
 
     def _invoke_dump_processors(
         self, tag: str, data, *, many: bool, original_data=None
@@ -1121,7 +1516,14 @@ class Schema(metaclass=SchemaMeta):
             unknown=unknown,
         )
 
-    def _invoke_field_validators(self, *, error_store: ErrorStore, data, many: bool):
+    def _invoke_field_validators(
+        self,
+        *,
+        error_store: ErrorStore,
+        data,
+        many: bool,
+        baseline=None,
+    ):
         for attr_name, _, validator_kwargs in self._hooks[VALIDATES]:
             validator = getattr(self, attr_name)
 
@@ -1134,6 +1536,8 @@ class Schema(metaclass=SchemaMeta):
                     if field_name in self.declared_fields:
                         continue
                     raise ValueError(f'"{field_name}" field does not exist.') from error
+                if isinstance(field_obj, ma_fields.Derived):
+                    continue
 
                 data_key = (
                     field_obj.data_key if field_obj.data_key is not None else field_name
@@ -1142,34 +1546,71 @@ class Schema(metaclass=SchemaMeta):
 
                 if many:
                     for idx, item in enumerate(data):
-                        try:
-                            value = item[field_obj.attribute or field_name]
-                        except KeyError:
-                            pass
-                        else:
-                            validated_value = self._call_and_store(
-                                getter_func=do_validate,
-                                data=value,
-                                field_name=data_key,
-                                error_store=error_store,
-                                index=(idx if self.opts.index_errors else None),
-                            )
-                            if validated_value is missing:
-                                item.pop(field_name, None)
-                else:
-                    try:
-                        value = data[field_obj.attribute or field_name]
-                    except KeyError:
-                        pass
-                    else:
-                        validated_value = self._call_and_store(
-                            getter_func=do_validate,
-                            data=value,
-                            field_name=data_key,
+                        self._run_field_validator_on_item(
+                            do_validate,
+                            field_obj=field_obj,
+                            field_name=field_name,
+                            data_key=data_key,
+                            item=item,
                             error_store=error_store,
+                            index=(idx if self.opts.index_errors else None),
                         )
-                        if validated_value is missing:
-                            data.pop(field_name, None)
+                else:
+                    self._run_field_validator_on_item(
+                        do_validate,
+                        field_obj=field_obj,
+                        field_name=field_name,
+                        data_key=data_key,
+                        item=data,
+                        error_store=error_store,
+                        index=None,
+                    )
+
+        # Ordinary fields are fully deserialized and validated; now compute
+        # derived fields (with their own validators) in dependency order.
+        if many:
+            for idx, item in enumerate(data):
+                item_baseline = (
+                    baseline[idx] if baseline is not None and idx < len(baseline) else None
+                )
+                self._compute_derived_fields(
+                    item,
+                    error_store=error_store,
+                    index=(idx if self.opts.index_errors else None),
+                    baseline=item_baseline,
+                )
+        else:
+            self._compute_derived_fields(
+                data,
+                error_store=error_store,
+                index=None,
+                baseline=baseline,
+            )
+
+    def _run_field_validator_on_item(
+        self,
+        validator,
+        *,
+        field_obj: Field,
+        field_name: str,
+        data_key: str,
+        item: dict,
+        error_store: ErrorStore,
+        index: int | None,
+    ) -> None:
+        try:
+            value = item[field_obj.attribute or field_name]
+        except KeyError:
+            return
+        validated_value = self._call_and_store(
+            getter_func=validator,
+            data=value,
+            field_name=data_key,
+            error_store=error_store,
+            index=index,
+        )
+        if validated_value is missing:
+            item.pop(field_obj.attribute or field_name, None)
 
     def _invoke_schema_validators(
         self,
