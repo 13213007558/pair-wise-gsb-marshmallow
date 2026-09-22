@@ -310,6 +310,45 @@ If the object to be marshalled has a relationship to an object of the same type,
     #     }
     # }
 
+Discriminated unions
+--------------------
+
+When a single endpoint receives multiple event shapes, use
+:class:`DiscriminatedUnion <marshmallow.fields.DiscriminatedUnion>` to select
+a branch schema by the value of a discriminator field rather than trying each
+schema in turn. Only the selected branch is used for (de)serialization.
+
+.. code-block:: python
+
+    class ClickEventSchema(Schema):
+        kind = fields.Str(required=True)
+        x = fields.Int()
+        y = fields.Int()
+
+
+    class ViewEventSchema(Schema):
+        kind = fields.Str(required=True)
+        url = fields.Str()
+
+
+    class EnvelopeSchema(Schema):
+        event = fields.DiscriminatedUnion(
+            {"click": ClickEventSchema, "view": ViewEventSchema},
+            discriminator="kind",
+        )
+
+
+    EnvelopeSchema().load({"event": {"kind": "click", "x": 1, "y": 2}})
+    # {'event': {'kind': 'click', 'x': 1, 'y': 2}}
+
+    EnvelopeSchema().load({"event": {"kind": "hover"}})
+    # ValidationError: {'event': {'kind': ["Unknown discriminator value: 'hover'."]}}
+
+If the branch schemas declare the discriminator field with a ``data_key``,
+the external name is used to read the discriminator from the payload. On
+serialization, the branch is selected by reading the discriminator attribute
+from the object; a missing or unknown value raises a ``ValidationError``.
+
 Next steps
 ----------
 

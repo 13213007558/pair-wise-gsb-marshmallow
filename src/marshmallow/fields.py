@@ -52,6 +52,7 @@ __all__ = [
     "Date",
     "DateTime",
     "Decimal",
+    "DiscriminatedUnion",
     "Dict",
     "Email",
     "Enum",
@@ -727,6 +728,268 @@ class Pluck(Nested):
         else:
             value = {self._field_data_key: value}
         return self._load(value, partial=partial)
+
+
+class DiscriminatedUnion(Field):
+    """A field that dispatches to one of several
+    :class:`Schema <marshmallow.Schema>` branches based on the value of a
+    discriminator field in the payload.
+
+    Unlike trial-and-error union fields, the branch is selected exclusively by
+    looking up the discriminator value in ``mapping``. Only the selected
+    branch's schema is used for (de)serialization, so only that branch's
+    ``pre_load``/``post_load`` processors and validators run.
+
+    Example: ::
+
+        from marshmallow import Schema, fields
+
+
+        class ClickEventSchema(Schema):
+            kind = fields.Str(required=True)
+            x = fields.Int()
+            y = fields.Int()
+
+
+        class ViewEventSchema(Schema):
+            kind = fields.Str(required=True)
+            url = fields.Str()
+
+
+        class EnvelopeSchema(Schema):
+            event = fields.DiscriminatedUnion(
+                {"click": ClickEventSchema, "view": ViewEventSchema},
+                discriminator="kind",
+            )
+
+
+        EnvelopeSchema().load({"event": {"kind": "click", "x": 1, "y": 2}})
+        # => {'event': {'kind': 'click', 'x': 1, 'y': 2}}
+
+    If a branch schema declares the discriminator field with a ``data_key``,
+    that external name is used to read the discriminator from the payload.
+    All branches declaring a ``data_key`` for the discriminator must declare
+    the same one, otherwise a `ValueError` is raised when the field resolves
+    its schemas.
+
+    On serialization, the branch is selected by reading the ``discriminator``
+    attribute from the object. If the attribute is missing or its value has
+    no corresponding branch, a `ValidationError` is raised.
+
+    Branch schemas may be given as :class:`Schema <marshmallow.Schema>`
+    instances, classes, class names (strings), dictionaries, or callables
+    returning any of those, which allows recursive structures. Schema
+    instances are copied before ``only``/``exclude`` are applied,
+    so shared instances are never mutated.
+
+    :param mapping: Dictionary mapping discriminator values to schemas.
+    :param discriminator: Name of the discriminator field. Defaults to ``"type"``.
+    :param only: A list or tuple of fields to marshal, applied to every branch.
+    :param exclude: A list or tuple of fields to exclude, applied to every branch.
+    :param many: Whether the field is a collection of objects.
+    :param unknown: Whether to exclude, include, or raise an error for unknown
+        fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
+    :param kwargs: The same keyword arguments that :class:`Field` receives.
+
+    .. versionadded:: 4.4.0
+    """
+
+    #: Default error messages.
+    default_error_messages = {
+        "type": "Invalid type.",
+        "missing_discriminator": "Missing discriminator field: {discriminator_key!r}.",
+        "unknown_discriminator": "Unknown discriminator value: {discriminator_value!r}.",
+    }
+
+    def __init__(
+        self,
+        mapping: dict[
+            typing.Any,
+            Schema
+            | SchemaMeta
+            | str
+            | dict[str, Field]
+            | typing.Callable[[], Schema | SchemaMeta | str | dict[str, Field]],
+        ],
+        *,
+        discriminator: str = "type",
+        only: types.StrSequenceOrSet | None = None,
+        exclude: types.StrSequenceOrSet = (),
+        many: bool = False,
+        unknown: types.UnknownOption | None = None,
+        **kwargs: Unpack[_BaseFieldKwargs],
+    ):
+        if not isinstance(mapping, dict) or not mapping:
+            raise ValueError(
+                "`DiscriminatedUnion` requires a non-empty dict mapping "
+                "discriminator values to schemas."
+            )
+        if not isinstance(discriminator, str) or not discriminator:
+            raise ValueError("`discriminator` must be a non-empty string.")
+        if only is not None and not utils.is_sequence_but_not_string(only):
+            raise StringNotCollectionError('"only" should be a collection of strings.')
+        if not utils.is_sequence_but_not_string(exclude):
+            raise StringNotCollectionError(
+                '"exclude" should be a collection of strings.'
+            )
+        self.mapping = mapping
+        self.discriminator = discriminator
+        self.only = only
+        self.exclude = exclude
+        self.many = many
+        self.unknown = unknown
+        self._schemas: dict[typing.Any, Schema] | None = None
+        self._discriminator_key: str | None = None
+        super().__init__(**kwargs)
+
+    @property
+    def schemas(self) -> dict[typing.Any, Schema]:
+        """The resolved mapping of discriminator values to Schema objects."""
+        if self._schemas is None:
+            # defer the import of `marshmallow.schema` to avoid circular imports
+            from marshmallow.schema import Schema, SchemaMeta  # noqa: PLC0415
+
+            self._schemas = {
+                key: self._resolve_schema(
+                    nested, schema_base=Schema, schema_meta=SchemaMeta
+                )
+                for key, nested in self.mapping.items()
+            }
+        return self._schemas
+
+    def _resolve_schema(self, nested, *, schema_base, schema_meta) -> Schema:
+        if callable(nested) and not isinstance(nested, schema_meta):
+            nested = nested()
+        if isinstance(nested, dict):
+            nested = schema_base.from_dict(nested)
+        if isinstance(nested, schema_base):
+            schema = copy.copy(nested)
+            # Respect only and exclude passed from parent and re-initialize fields
+            set_class = typing.cast("type[set]", schema.set_class)
+            if self.only is not None:
+                if schema.only is not None:
+                    original = schema.only
+                else:  # only=None -> all fields
+                    original = schema.fields.keys()
+                schema.only = set_class(self.only) & set_class(original)
+            if self.exclude:
+                schema.exclude = set_class(self.exclude) | set_class(schema.exclude)
+            schema._init_fields()
+            return schema
+        if isinstance(nested, type) and issubclass(nested, schema_base):
+            schema_class: type[Schema] = nested
+        elif isinstance(nested, (str, bytes)):
+            schema_class = class_registry.get_class(nested, all=False)
+        else:
+            raise ValueError(
+                "`DiscriminatedUnion` mapping values must be a "
+                f"`Schema`, not {nested.__class__}."
+            )
+        return schema_class(only=self.only, exclude=self.exclude)
+
+    @property
+    def discriminator_key(self) -> str:
+        """The external key used to read the discriminator value from payloads.
+
+        This is the ``data_key`` declared on the discriminator field of the
+        branch schemas, or the discriminator field name itself if no branch
+        declares a ``data_key`` for it.
+        """
+        if self._discriminator_key is None:
+            data_keys = set()
+            for schema in self.schemas.values():
+                field_obj = schema.fields.get(self.discriminator)
+                if field_obj is not None and field_obj.data_key is not None:
+                    data_keys.add(field_obj.data_key)
+            if len(data_keys) > 1:
+                raise ValueError(
+                    "Conflicting `data_key` values for discriminator field "
+                    f"{self.discriminator!r} in `DiscriminatedUnion` branches: "
+                    f"{sorted(data_keys)}. All branches must use the same "
+                    "external name for the discriminator field."
+                )
+            self._discriminator_key = (
+                data_keys.pop() if data_keys else self.discriminator
+            )
+        return self._discriminator_key
+
+    def _select_schema(self, discriminator_value: typing.Any) -> Schema | None:
+        try:
+            return self.schemas[discriminator_value]
+        except (KeyError, TypeError):
+            # KeyError: no branch for this value
+            # TypeError: unhashable discriminator value
+            return None
+
+    def _missing_discriminator_error(self, key: str) -> ValidationError:
+        error = self.make_error("missing_discriminator", discriminator_key=key)
+        return ValidationError({key: error.messages})
+
+    def _unknown_discriminator_error(
+        self, key: str, value: typing.Any
+    ) -> ValidationError:
+        error = self.make_error("unknown_discriminator", discriminator_value=value)
+        return ValidationError({key: error.messages})
+
+    def _serialize(self, value, attr, obj, **kwargs):
+        if value is None:
+            return None
+        if self.many:
+            return [self._serialize_one(each) for each in value]
+        return self._serialize_one(value)
+
+    def _serialize_one(self, nested_obj):
+        key = self.discriminator_key
+        discriminator_value = utils.get_value(nested_obj, self.discriminator, missing_)
+        if discriminator_value is missing_:
+            raise self._missing_discriminator_error(key)
+        schema = self._select_schema(discriminator_value)
+        if schema is None:
+            raise self._unknown_discriminator_error(key, discriminator_value)
+        return schema.dump(nested_obj)
+
+    def _deserialize(self, value, attr, data, partial=None, **kwargs):
+        """Same as :meth:`Field._deserialize` with additional ``partial`` argument.
+
+        :param partial: For nested schemas, the ``partial``
+            parameter passed to `marshmallow.Schema.load`.
+        """
+        if self.many:
+            if not utils.is_collection(value):
+                raise self.make_error(
+                    "type", input=value, type=value.__class__.__name__
+                )
+            result = []
+            errors = {}
+            for idx, each in enumerate(value):
+                try:
+                    result.append(self._deserialize_one(each, partial=partial))
+                except ValidationError as error:
+                    if error.valid_data is not None:
+                        result.append(error.valid_data)
+                    errors[idx] = error.messages
+            if errors:
+                raise ValidationError(errors, valid_data=result)
+            return result
+        return self._deserialize_one(value, partial=partial)
+
+    def _deserialize_one(self, value, partial=None):
+        if not isinstance(value, _Mapping):
+            raise self.make_error("type", input=value, type=value.__class__.__name__)
+        key = self.discriminator_key
+        discriminator_value = value.get(key, missing_)
+        if discriminator_value is missing_:
+            raise self._missing_discriminator_error(key)
+        schema = self._select_schema(discriminator_value)
+        if schema is None:
+            raise self._unknown_discriminator_error(key, discriminator_value)
+        try:
+            valid_data = schema.load(value, unknown=self.unknown, partial=partial)
+        except ValidationError as error:
+            raise ValidationError(
+                error.messages, valid_data=error.valid_data
+            ) from error
+        return valid_data
 
 
 class List(Field[list[_InternalT | None]]):

@@ -6,6 +6,9 @@ Changelog
 
 Features:
 
+- Add `DiscriminatedUnion <marshmallow.fields.DiscriminatedUnion>` field,
+  which selects a branch schema by the value of a discriminator field
+  instead of trying each schema in turn.
 - Simplify `get_value` to match actual usage (:pr:`3024`).
 
 Bug fixes:
