@@ -6,6 +6,10 @@ Changelog
 
 Features:
 
+- Add `Schema.update_load <marshmallow.schema.Schema.update_load>` to deserialize
+  a partial patch, recursively merge it into an existing deserialized object,
+  and run schema-level validation on the merged result. Returns the merged
+  result together with the submitted field paths.
 - Simplify `get_value` to match actual usage (:pr:`3024`).
 
 Bug fixes:
