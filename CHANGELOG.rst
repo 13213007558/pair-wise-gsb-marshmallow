@@ -7,6 +7,17 @@ Changelog
 Features:
 
 - Simplify `get_value` to match actual usage (:pr:`3024`).
+- Add `ValidationError.issues`: a list of structured, translation-independent
+  `ValidationIssue <marshmallow.exceptions.ValidationIssue>` records. Each
+  issue carries a stable ``code``, ``params``, a segment-wise input ``path``
+  (list indices stay ints, so index ``0`` and a field named ``"0"`` are
+  distinguishable) and a ``stage`` (field deserialization, field validation
+  or schema validation). Nested fields, ``Dict`` key validation, ``List``/
+  ``Tuple`` items, ``validates``/``validates_schema`` methods and schema-level
+  errors all feed into this list, and multiple issues at the same path are
+  preserved. ``ValidationError`` now accepts ``code`` and ``params`` keyword
+  arguments; errors raised without a code are categorized as ``user_error``.
+  ``messages``, ``normalized_messages`` and ``valid_data`` are unchanged.
 
 Bug fixes:
 

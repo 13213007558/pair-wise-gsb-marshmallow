@@ -31,6 +31,11 @@ from marshmallow.decorators import (
 )
 from marshmallow.error_store import ErrorStore
 from marshmallow.exceptions import SCHEMA, StringNotCollectionError, ValidationError
+from marshmallow.exceptions import (
+    STAGE_DESERIALIZE,
+    STAGE_SCHEMA_VALIDATE,
+    STAGE_VALIDATE,
+)
 from marshmallow.orderedset import OrderedSet
 from marshmallow.utils import (
     get_value,
@@ -41,6 +46,13 @@ from marshmallow.utils import (
 
 if typing.TYPE_CHECKING:
     from marshmallow.fields import Field
+
+
+def _issues_with_field_prefix(error: ValidationError) -> list:
+    """Return the error's issues, prefixed with its field name if it has one."""
+    if error.field_name == SCHEMA:
+        return list(error.issues)
+    return [issue._with_prefix((error.field_name,)) for issue in error.issues]
 
 
 def _get_fields(attrs) -> list[tuple[str, Field]]:
@@ -508,7 +520,9 @@ class Schema(metaclass=SchemaMeta):
     ##### Serialization/Deserialization API #####
 
     @staticmethod
-    def _call_and_store(getter_func, data, *, field_name, error_store, index=None):
+    def _call_and_store(
+        getter_func, data, *, field_name, error_store, index=None, stage=None
+    ):
         """Call ``getter_func`` with ``data`` as its argument, and store any `ValidationErrors`.
 
         :param getter_func: Function for getting the serialized/deserialized
@@ -517,11 +531,17 @@ class Schema(metaclass=SchemaMeta):
         :param field_name: Field name.
         :param index: Index of the item being validated, if validating a collection,
             otherwise `None`.
+        :param stage: Issue stage to set on stored issues that do not have one
+            yet, otherwise `None`.
         """
         try:
             value = getter_func(data)
         except ValidationError as error:
-            error_store.store_error(error.messages, field_name, index=index)
+            if stage is not None:
+                error._fill_stage(stage)
+            error_store.store_error(
+                error.messages, field_name, index=index, issues=error.issues
+            )
             # When a Nested field fails validation, the marshalled data is stored
             # on the ValidationError's valid_data attribute
             return error.valid_data or missing
@@ -623,7 +643,12 @@ class Schema(metaclass=SchemaMeta):
         index = index if self.opts.index_errors else None
         if many:
             if not is_sequence_but_not_string(data):
-                error_store.store_error([self.error_messages["type"]], index=index)
+                error_store.store_error(
+                    [self.error_messages["type"]],
+                    index=index,
+                    code="type",
+                    stage=STAGE_DESERIALIZE,
+                )
                 ret_l = []
             else:
                 ret_l = [
@@ -641,7 +666,12 @@ class Schema(metaclass=SchemaMeta):
         ret_d = self.dict_class()
         # Check data is a dict
         if not isinstance(data, Mapping):
-            error_store.store_error([self.error_messages["type"]], index=index)
+            error_store.store_error(
+                [self.error_messages["type"]],
+                index=index,
+                code="type",
+                stage=STAGE_DESERIALIZE,
+            )
         else:
             partial_is_collection = is_collection(partial)
             for attr_name, field_obj in self.load_fields.items():
@@ -701,6 +731,8 @@ class Schema(metaclass=SchemaMeta):
                             [self.error_messages["unknown"]],
                             key,
                             index,
+                            code="unknown",
+                            stage=STAGE_DESERIALIZE,
                         )
         return ret_d
 
@@ -792,6 +824,7 @@ class Schema(metaclass=SchemaMeta):
                 validator_func(output, partial=partial, many=many, unknown=unknown)
         except ValidationError as err:
             field_name = err.field_name
+            err._fill_stage(STAGE_SCHEMA_VALIDATE)
             data_key: str
             if field_name == SCHEMA:
                 data_key = SCHEMA
@@ -810,7 +843,9 @@ class Schema(metaclass=SchemaMeta):
                     )
                 else:
                     data_key = field_name
-            error_store.store_error(err.messages, data_key, index=index)
+            error_store.store_error(
+                err.messages, data_key, index=index, issues=err.issues
+            )
 
     def validate(
         self,
@@ -866,6 +901,7 @@ class Schema(metaclass=SchemaMeta):
         """
         error_store = ErrorStore()
         errors: dict[str, list[str]] = {}
+        issues: list = []
         many = self.many if many is None else bool(many)
         unknown = self.unknown if unknown is None else unknown
         if partial is None:
@@ -883,6 +919,7 @@ class Schema(metaclass=SchemaMeta):
                 )
             except ValidationError as err:
                 errors = err.normalized_messages()
+                issues = _issues_with_field_prefix(err)
                 result: list | dict | None = None
         else:
             processed_data = data
@@ -923,6 +960,7 @@ class Schema(metaclass=SchemaMeta):
                     field_errors=field_errors,
                 )
             errors = error_store.errors
+            issues = error_store.issues
             # Run post processors
             if not errors and postprocess and self._hooks[POST_LOAD]:
                 try:
@@ -936,8 +974,9 @@ class Schema(metaclass=SchemaMeta):
                     )
                 except ValidationError as err:
                     errors = err.normalized_messages()
+                    issues = _issues_with_field_prefix(err)
         if errors:
-            exc = ValidationError(errors, data=data, valid_data=result)
+            exc = ValidationError(errors, data=data, valid_data=result, issues=issues)
             self.handle_error(exc, data, many=many, partial=partial)
             raise exc
 
@@ -1153,6 +1192,7 @@ class Schema(metaclass=SchemaMeta):
                                 field_name=data_key,
                                 error_store=error_store,
                                 index=(idx if self.opts.index_errors else None),
+                                stage=STAGE_VALIDATE,
                             )
                             if validated_value is missing:
                                 item.pop(field_name, None)
@@ -1167,6 +1207,7 @@ class Schema(metaclass=SchemaMeta):
                             data=value,
                             field_name=data_key,
                             error_store=error_store,
+                            stage=STAGE_VALIDATE,
                         )
                         if validated_value is missing:
                             data.pop(field_name, None)

@@ -6,7 +6,7 @@
     Users should not need to use this module directly.
 """
 
-from marshmallow.exceptions import SCHEMA
+from marshmallow.exceptions import SCHEMA, _issues_from_messages
 
 
 class ErrorStore:
@@ -14,16 +14,36 @@ class ErrorStore:
         #: Dictionary of errors stored during serialization
         self.errors = {}
 
-    def store_error(self, messages, field_name=SCHEMA, index=None):
+        #: List of structured issues stored during serialization
+        self.issues = []
+
+    def store_error(
+        self,
+        messages,
+        field_name=SCHEMA,
+        index=None,
+        *,
+        issues=None,
+        code=None,
+        stage=None,
+    ):
         # field error  -> store/merge error messages under field name key
         # schema error -> if string or list, store/merge under _schema key
         #              -> if dict, store/merge with other top-level keys
+        raw_messages = messages
         messages = copy_containers(messages)
         if field_name != SCHEMA or not isinstance(messages, dict):
             messages = {field_name: messages}
+        # Schema-level errors are stored under the _schema message key, but
+        # their issue path is the root (empty prefix).
+        prefix = () if field_name == SCHEMA else (field_name,)
         if index is not None:
             messages = {index: messages}
+            prefix = (index, *prefix)
         self.errors = merge_errors(self.errors, messages)
+        if issues is None:
+            issues = _issues_from_messages(raw_messages, code=code, stage=stage)
+        self.issues.extend(issue._with_prefix(prefix) for issue in issues)
 
 
 def copy_containers(errors):
