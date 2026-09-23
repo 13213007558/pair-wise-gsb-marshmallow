@@ -7,7 +7,7 @@ from marshmallow.decorators import (
     validates,
     validates_schema,
 )
-from marshmallow.exceptions import ValidationError
+from marshmallow.exceptions import Issue, IssueStage, ValidationError
 from marshmallow.schema import Schema, SchemaOpts
 
 from . import fields
@@ -16,6 +16,8 @@ __all__ = [
     "EXCLUDE",
     "INCLUDE",
     "RAISE",
+    "Issue",
+    "IssueStage",
     "Schema",
     "SchemaOpts",
     "ValidationError",

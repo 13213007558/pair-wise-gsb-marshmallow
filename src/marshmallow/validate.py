@@ -71,17 +71,19 @@ class And(Validator):
     def __call__(self, value: typing.Any) -> typing.Any:
         errors: list[str | dict] = []
         kwargs: dict[str, typing.Any] = {}
+        issues: list = []
         for validator in self.validators:
             try:
                 validator(value)
             except ValidationError as err:
                 kwargs.update(err.kwargs)
+                issues.extend(err.issues)
                 if isinstance(err.messages, dict):
                     errors.append(err.messages)
                 else:
                     errors.extend(err.messages)
         if errors:
-            raise ValidationError(errors, **kwargs)
+            raise ValidationError(errors, issues=issues, **kwargs)
         return value
 
 
@@ -189,6 +191,7 @@ class URL(Validator):
 
     default_message = "Not a valid URL."
     default_schemes = {"http", "https", "ftp", "ftps"}
+    code = "url"
 
     def __init__(
         self,
@@ -218,14 +221,14 @@ class URL(Validator):
     def __call__(self, value: str) -> str:
         message = self._format_error(value)
         if not value:
-            raise ValidationError(message)
+            raise ValidationError(message, code=self.code)
 
         # Check first if the scheme is valid
         scheme = None
         if "://" in value:
             scheme = value.split("://", maxsplit=1)[0].lower()
             if scheme not in self.schemes:
-                raise ValidationError(message)
+                raise ValidationError(message, code=self.code)
 
         regex = self._regex(
             relative=self.relative, absolute=self.absolute, require_tld=self.require_tld
@@ -239,7 +242,7 @@ class URL(Validator):
             matched = regex.search(value)
 
         if not matched:
-            raise ValidationError(message)
+            raise ValidationError(message, code=self.code)
 
         return value
 
@@ -275,6 +278,7 @@ class Email(Validator):
     DOMAIN_WHITELIST = ("localhost",)
 
     default_message = "Not a valid email address."
+    code = "email"
 
     def __init__(self, *, error: str | None = None):
         self.error: str = error or self.default_message
@@ -286,16 +290,16 @@ class Email(Validator):
         message = self._format_error(value)
 
         if not value or "@" not in value:
-            raise ValidationError(message)
+            raise ValidationError(message, code=self.code)
 
         user_part, domain_part = value.rsplit("@", 1)
 
         if not self.USER_REGEX.match(user_part):
-            raise ValidationError(message)
+            raise ValidationError(message, code=self.code)
 
         if domain_part not in self.DOMAIN_WHITELIST:
             if not self.DOMAIN_REGEX.match(domain_part):
-                raise ValidationError(message)
+                raise ValidationError(message, code=self.code)
 
         return value
 
@@ -327,6 +331,7 @@ class Range(Validator):
     message_gt = "greater than"
     message_lte = "less than or equal to"
     message_lt = "less than"
+    code = "range"
 
     def __init__(
         self,
@@ -366,13 +371,21 @@ class Range(Validator):
             value < self.min if self.min_inclusive else value <= self.min
         ):
             message = self.message_min if self.max is None else self.message_all
-            raise ValidationError(self._format_error(value, message))
+            raise ValidationError(
+                self._format_error(value, message),
+                code=self.code,
+                params={"min": self.min, "max": self.max},
+            )
 
         if self.max is not None and (
             value > self.max if self.max_inclusive else value >= self.max
         ):
             message = self.message_max if self.min is None else self.message_all
-            raise ValidationError(self._format_error(value, message))
+            raise ValidationError(
+                self._format_error(value, message),
+                code=self.code,
+                params={"min": self.min, "max": self.max},
+            )
 
         return value
 
@@ -399,6 +412,7 @@ class Length(Validator):
     message_max = "Longer than maximum length {max}."
     message_all = "Length must be between {min} and {max}."
     message_equal = "Length must be {equal}."
+    code = "length"
 
     def __init__(
         self,
@@ -432,16 +446,28 @@ class Length(Validator):
 
         if self.equal is not None:
             if length != self.equal:
-                raise ValidationError(self._format_error(value, self.message_equal))
+                raise ValidationError(
+                    self._format_error(value, self.message_equal),
+                    code=self.code,
+                    params={"min": self.min, "max": self.max, "equal": self.equal},
+                )
             return value
 
         if self.min is not None and length < self.min:
             message = self.message_min if self.max is None else self.message_all
-            raise ValidationError(self._format_error(value, message))
+            raise ValidationError(
+                self._format_error(value, message),
+                code=self.code,
+                params={"min": self.min, "max": self.max, "equal": self.equal},
+            )
 
         if self.max is not None and length > self.max:
             message = self.message_max if self.min is None else self.message_all
-            raise ValidationError(self._format_error(value, message))
+            raise ValidationError(
+                self._format_error(value, message),
+                code=self.code,
+                params={"min": self.min, "max": self.max, "equal": self.equal},
+            )
 
         return value
 
@@ -456,6 +482,7 @@ class Equal(Validator):
     """
 
     default_message = "Must be equal to {other}."
+    code = "equal"
 
     def __init__(self, comparable, *, error: str | None = None):
         self.comparable = comparable
@@ -469,7 +496,11 @@ class Equal(Validator):
 
     def __call__(self, value: _T) -> _T:
         if value != self.comparable:
-            raise ValidationError(self._format_error(value))
+            raise ValidationError(
+                self._format_error(value),
+                code=self.code,
+                params={"other": self.comparable},
+            )
         return value
 
 
@@ -489,6 +520,7 @@ class Regexp(Validator):
     """
 
     default_message = "String does not match expected pattern."
+    code = "regexp"
 
     def __init__(
         self,
@@ -516,7 +548,11 @@ class Regexp(Validator):
 
     def __call__(self, value):
         if self.regex.match(value) is None:
-            raise ValidationError(self._format_error(value))
+            raise ValidationError(
+                self._format_error(value),
+                code=self.code,
+                params={"regex": self.regex.pattern},
+            )
 
         return value
 
@@ -534,6 +570,7 @@ class Predicate(Validator):
     """
 
     default_message = "Invalid input."
+    code = "predicate"
 
     def __init__(self, method: str, *, error: str | None = None, **kwargs):
         self.method = method
@@ -550,7 +587,11 @@ class Predicate(Validator):
         method = getattr(value, self.method)
 
         if not method(**self.kwargs):
-            raise ValidationError(self._format_error(value))
+            raise ValidationError(
+                self._format_error(value),
+                code=self.code,
+                params={"method": self.method},
+            )
 
         return value
 
@@ -564,6 +605,7 @@ class NoneOf(Validator):
     """
 
     default_message = "Invalid input."
+    code = "none_of"
 
     def __init__(self, iterable: typing.Iterable, *, error: str | None = None):
         self.iterable = iterable
@@ -579,7 +621,11 @@ class NoneOf(Validator):
     def __call__(self, value: typing.Any) -> typing.Any:
         try:
             if value in self.iterable:
-                raise ValidationError(self._format_error(value))
+                raise ValidationError(
+                    self._format_error(value),
+                    code=self.code,
+                    params={"values": list(self.iterable)},
+                )
         except TypeError:
             pass
 
@@ -596,6 +642,7 @@ class OneOf(Validator):
     """
 
     default_message = "Must be one of: {choices}."
+    code = "one_of"
 
     def __init__(
         self,
@@ -621,9 +668,17 @@ class OneOf(Validator):
     def __call__(self, value: typing.Any) -> typing.Any:
         try:
             if value not in self.choices:
-                raise ValidationError(self._format_error(value))
+                raise ValidationError(
+                    self._format_error(value),
+                    code=self.code,
+                    params={"choices": list(self.choices), "labels": list(self.labels)},
+                )
         except TypeError as error:
-            raise ValidationError(self._format_error(value)) from error
+            raise ValidationError(
+                self._format_error(value),
+                code=self.code,
+                params={"choices": list(self.choices), "labels": list(self.labels)},
+            ) from error
 
         return value
 
@@ -671,6 +726,7 @@ class ContainsOnly(OneOf):
     """
 
     default_message = "One or more of the choices you made was not in: {choices}."
+    code = "contains_only"
 
     def _format_error(self, value: typing.Sequence[typing.Any]) -> str:
         value_text = ", ".join(str(val) for val in value)
@@ -680,7 +736,11 @@ class ContainsOnly(OneOf):
         # We can't use set.issubset because does not handle unhashable types
         for val in value:
             if val not in self.choices:
-                raise ValidationError(self._format_error(value))
+                raise ValidationError(
+                    self._format_error(value),
+                    code=self.code,
+                    params={"choices": list(self.choices), "labels": list(self.labels)},
+                )
         return value
 
 
@@ -696,6 +756,7 @@ class ContainsNoneOf(NoneOf):
     """
 
     default_message = "One or more of the choices you made was in: {values}."
+    code = "contains_none_of"
 
     def _format_error(self, value: typing.Sequence[typing.Any]) -> str:
         value_text = ", ".join(str(val) for val in value)
@@ -704,5 +765,9 @@ class ContainsNoneOf(NoneOf):
     def __call__(self, value: typing.Sequence[_T]) -> typing.Sequence[_T]:
         for val in value:
             if val in self.iterable:
-                raise ValidationError(self._format_error(value))
+                raise ValidationError(
+                    self._format_error(value),
+                    code=self.code,
+                    params={"values": list(self.iterable)},
+                )
         return value

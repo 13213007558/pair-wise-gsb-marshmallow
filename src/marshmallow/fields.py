@@ -31,6 +31,8 @@ else:
 from marshmallow import class_registry, types, utils, validate
 from marshmallow.constants import missing as missing_
 from marshmallow.exceptions import (
+    Issue,
+    IssueStage,
     StringNotCollectionError,
     ValidationError,
     _FieldInstanceResolutionError,
@@ -300,7 +302,7 @@ class Field(typing.Generic[_InternalT]):
             raise AssertionError(message) from error
         if isinstance(msg, (str, bytes)):
             msg = msg.format(**kwargs)
-        return ValidationError(msg)
+        return ValidationError(msg, code=key, params=kwargs)
 
     def _validate_missing(self, value: typing.Any) -> None:
         """Validate missing values. Raise a :exc:`ValidationError` if
@@ -377,7 +379,11 @@ class Field(typing.Generic[_InternalT]):
         """
         # Validate required fields, deserialize, then validate
         # deserialized value
-        self._validate_missing(value)
+        try:
+            self._validate_missing(value)
+        except ValidationError as error:
+            error.with_stage(IssueStage.FIELD_VALIDATION)
+            raise
         if value is missing_:
             _miss = self.load_default
             return _miss() if callable(_miss) else _miss
@@ -389,9 +395,17 @@ class Field(typing.Generic[_InternalT]):
         if self.allow_none and value is None:
             return None
 
-        output = self._deserialize(value, attr, data, **kwargs)
+        try:
+            output = self._deserialize(value, attr, data, **kwargs)
+        except ValidationError as error:
+            error.with_stage(IssueStage.FIELD_CONVERSION)
+            raise
         # Apply validators
-        self._validate(output)
+        try:
+            self._validate(output)
+        except ValidationError as error:
+            error.with_stage(IssueStage.FIELD_VALIDATION)
+            raise
 
         # Apply post_load functions
         for func in self.post_load:
@@ -643,7 +657,7 @@ class Nested(Field):
             valid_data = self.schema.load(value, unknown=self.unknown, partial=partial)
         except ValidationError as error:
             raise ValidationError(
-                error.messages, valid_data=error.valid_data
+                error.messages, valid_data=error.valid_data, issues=error.issues
             ) from error
         return valid_data
 
@@ -783,6 +797,7 @@ class List(Field[list[_InternalT | None]]):
 
         result = []
         errors = {}
+        issues: list[Issue] = []
         for idx, each in enumerate(value):
             try:
                 result.append(self.inner.deserialize(each, **kwargs))
@@ -790,8 +805,9 @@ class List(Field[list[_InternalT | None]]):
                 if error.valid_data is not None:
                     result.append(typing.cast("_InternalT", error.valid_data))
                 errors.update({idx: error.messages})
+                issues.extend(issue.with_path_prefix((idx,)) for issue in error.issues)
         if errors:
-            raise ValidationError(errors, valid_data=result)
+            raise ValidationError(errors, valid_data=result, issues=issues)
         return result
 
 
@@ -877,6 +893,7 @@ class Tuple(Field[tuple]):
 
         result = []
         errors = {}
+        issues: list[Issue] = []
 
         for idx, (field, each) in enumerate(zip(self.tuple_fields, value, strict=True)):
             try:
@@ -885,8 +902,9 @@ class Tuple(Field[tuple]):
                 if error.valid_data is not None:
                     result.append(error.valid_data)
                 errors.update({idx: error.messages})
+                issues.extend(issue.with_path_prefix((idx,)) for issue in error.issues)
         if errors:
-            raise ValidationError(errors, valid_data=result)
+            raise ValidationError(errors, valid_data=result, issues=issues)
 
         return tuple(result)
 
@@ -1692,6 +1710,7 @@ class Mapping(Field[_MappingT], metaclass=abc.ABCMeta):
             return self.mapping_type(value)
 
         errors = collections.defaultdict(dict)
+        issues: list[Issue] = []
 
         # Deserialize keys
         if self.key_field is None:
@@ -1703,6 +1722,9 @@ class Mapping(Field[_MappingT], metaclass=abc.ABCMeta):
                     keys[key] = self.key_field.deserialize(key, **kwargs)
                 except ValidationError as error:
                     errors[key]["key"] = error.messages
+                    issues.extend(
+                        issue.with_path_prefix((key, "key")) for issue in error.issues
+                    )
 
         # Deserialize values
         result = self.mapping_type()
@@ -1716,6 +1738,9 @@ class Mapping(Field[_MappingT], metaclass=abc.ABCMeta):
                     deser_val = self.value_field.deserialize(val, **kwargs)
                 except ValidationError as error:
                     errors[key]["value"] = error.messages
+                    issues.extend(
+                        issue.with_path_prefix((key, "value")) for issue in error.issues
+                    )
                     if error.valid_data is not None and key in keys:
                         result[keys[key]] = error.valid_data
                 else:
@@ -1723,7 +1748,7 @@ class Mapping(Field[_MappingT], metaclass=abc.ABCMeta):
                         result[keys[key]] = deser_val
 
         if errors:
-            raise ValidationError(errors, valid_data=result)
+            raise ValidationError(errors, valid_data=result, issues=issues)
 
         return result
 

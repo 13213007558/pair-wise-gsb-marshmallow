@@ -6,6 +6,15 @@ Changelog
 
 Features:
 
+- Add `ValidationError.issues <marshmallow.exceptions.ValidationError.issues>`:
+  a translation-independent list of structured issues. Each
+  `Issue <marshmallow.exceptions.Issue>` carries a stable ``code``,
+  structured ``params``, a segmented input ``path`` (integer segments for
+  collection indices, strings for field names), and the pipeline ``stage``
+  (see `IssueStage <marshmallow.exceptions.IssueStage>`). `ValidationError`
+  accepts ``code`` and ``params`` keyword arguments; errors raised without
+  a code are categorized as ``user_error``. ``messages``,
+  ``normalized_messages`` and ``valid_data`` are unchanged.
 - Simplify `get_value` to match actual usage (:pr:`3024`).
 
 Bug fixes:

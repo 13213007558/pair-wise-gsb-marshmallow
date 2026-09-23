@@ -30,7 +30,12 @@ from marshmallow.decorators import (
     VALIDATES_SCHEMA,
 )
 from marshmallow.error_store import ErrorStore
-from marshmallow.exceptions import SCHEMA, StringNotCollectionError, ValidationError
+from marshmallow.exceptions import (
+    SCHEMA,
+    IssueStage,
+    StringNotCollectionError,
+    ValidationError,
+)
 from marshmallow.orderedset import OrderedSet
 from marshmallow.utils import (
     get_value,
@@ -508,7 +513,9 @@ class Schema(metaclass=SchemaMeta):
     ##### Serialization/Deserialization API #####
 
     @staticmethod
-    def _call_and_store(getter_func, data, *, field_name, error_store, index=None):
+    def _call_and_store(
+        getter_func, data, *, field_name, error_store, index=None, stage=None
+    ):
         """Call ``getter_func`` with ``data`` as its argument, and store any `ValidationErrors`.
 
         :param getter_func: Function for getting the serialized/deserialized
@@ -517,11 +524,19 @@ class Schema(metaclass=SchemaMeta):
         :param field_name: Field name.
         :param index: Index of the item being validated, if validating a collection,
             otherwise `None`.
+        :param stage: Pipeline stage to tag stored issues with, see
+            `marshmallow.exceptions.IssueStage`.
         """
         try:
             value = getter_func(data)
         except ValidationError as error:
-            error_store.store_error(error.messages, field_name, index=index)
+            error_store.store_error(
+                error.messages,
+                field_name,
+                index=index,
+                issues=error.issues,
+                stage=stage,
+            )
             # When a Nested field fails validation, the marshalled data is stored
             # on the ValidationError's valid_data attribute
             return error.valid_data or missing
@@ -623,7 +638,12 @@ class Schema(metaclass=SchemaMeta):
         index = index if self.opts.index_errors else None
         if many:
             if not is_sequence_but_not_string(data):
-                error_store.store_error([self.error_messages["type"]], index=index)
+                error_store.store_error(
+                    [self.error_messages["type"]],
+                    index=index,
+                    code="type",
+                    stage=IssueStage.SCHEMA_VALIDATION,
+                )
                 ret_l = []
             else:
                 ret_l = [
@@ -641,7 +661,12 @@ class Schema(metaclass=SchemaMeta):
         ret_d = self.dict_class()
         # Check data is a dict
         if not isinstance(data, Mapping):
-            error_store.store_error([self.error_messages["type"]], index=index)
+            error_store.store_error(
+                [self.error_messages["type"]],
+                index=index,
+                code="type",
+                stage=IssueStage.SCHEMA_VALIDATION,
+            )
         else:
             partial_is_collection = is_collection(partial)
             for attr_name, field_obj in self.load_fields.items():
@@ -683,6 +708,7 @@ class Schema(metaclass=SchemaMeta):
                     field_name=field_name,
                     error_store=error_store,
                     index=index,
+                    stage=IssueStage.FIELD_CONVERSION,
                 )
                 if value is not missing:
                     key = field_obj.attribute or attr_name
@@ -701,6 +727,8 @@ class Schema(metaclass=SchemaMeta):
                             [self.error_messages["unknown"]],
                             key,
                             index,
+                            code="unknown",
+                            stage=IssueStage.SCHEMA_VALIDATION,
                         )
         return ret_d
 
@@ -810,7 +838,13 @@ class Schema(metaclass=SchemaMeta):
                     )
                 else:
                     data_key = field_name
-            error_store.store_error(err.messages, data_key, index=index)
+            error_store.store_error(
+                err.messages,
+                data_key,
+                index=index,
+                issues=err.issues,
+                stage=IssueStage.SCHEMA_VALIDATION,
+            )
 
     def validate(
         self,
@@ -866,6 +900,7 @@ class Schema(metaclass=SchemaMeta):
         """
         error_store = ErrorStore()
         errors: dict[str, list[str]] = {}
+        issues: list = []
         many = self.many if many is None else bool(many)
         unknown = self.unknown if unknown is None else unknown
         if partial is None:
@@ -883,6 +918,7 @@ class Schema(metaclass=SchemaMeta):
                 )
             except ValidationError as err:
                 errors = err.normalized_messages()
+                issues = self._issues_from_error(err)
                 result: list | dict | None = None
         else:
             processed_data = data
@@ -923,6 +959,7 @@ class Schema(metaclass=SchemaMeta):
                     field_errors=field_errors,
                 )
             errors = error_store.errors
+            issues = error_store.issues
             # Run post processors
             if not errors and postprocess and self._hooks[POST_LOAD]:
                 try:
@@ -936,12 +973,24 @@ class Schema(metaclass=SchemaMeta):
                     )
                 except ValidationError as err:
                     errors = err.normalized_messages()
+                    issues = self._issues_from_error(err)
         if errors:
-            exc = ValidationError(errors, data=data, valid_data=result)
+            exc = ValidationError(errors, data=data, valid_data=result, issues=issues)
             self.handle_error(exc, data, many=many, partial=partial)
             raise exc
 
         return result
+
+    @staticmethod
+    def _issues_from_error(error: ValidationError) -> list:
+        """Return the issues carried by ``error``, prefixed by its field name
+        and tagged as schema-level issues if not already tagged.
+        """
+        prefix = () if error.field_name == SCHEMA else (error.field_name,)
+        return [
+            issue.with_stage(IssueStage.SCHEMA_VALIDATION).with_path_prefix(prefix)
+            for issue in error.issues
+        ]
 
     def _normalize_nested_options(self) -> None:
         """Apply then flatten nested schema options.
@@ -1153,6 +1202,7 @@ class Schema(metaclass=SchemaMeta):
                                 field_name=data_key,
                                 error_store=error_store,
                                 index=(idx if self.opts.index_errors else None),
+                                stage=IssueStage.FIELD_VALIDATION,
                             )
                             if validated_value is missing:
                                 item.pop(field_name, None)
@@ -1167,6 +1217,7 @@ class Schema(metaclass=SchemaMeta):
                             data=value,
                             field_name=data_key,
                             error_store=error_store,
+                            stage=IssueStage.FIELD_VALIDATION,
                         )
                         if validated_value is missing:
                             data.pop(field_name, None)
