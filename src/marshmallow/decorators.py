@@ -71,6 +71,8 @@ import functools
 import typing
 from collections import defaultdict
 
+from marshmallow.exceptions import StringNotCollectionError
+
 PRE_DUMP = "pre_dump"
 POST_DUMP = "post_dump"
 PRE_LOAD = "pre_load"
@@ -100,6 +102,8 @@ def validates_schema(
     pass_collection: bool = False,
     pass_original: bool = False,
     skip_on_field_errors: bool = True,
+    requires: typing.Iterable[str] | None = None,
+    pass_missing: bool = False,
 ) -> typing.Callable[..., typing.Any]:
     """Register a schema-level validator.
 
@@ -113,6 +117,21 @@ def validates_schema(
     If ``skip_on_field_errors=True``, this validation method will be skipped whenever
     validation errors have been detected when validating fields.
 
+    If ``requires`` is declared, it lists the names of the fields this validator
+    depends on, and takes precedence over ``skip_on_field_errors``. The validator
+    is only called when every required field was successfully deserialized and
+    passed field-level validation; errors on unrelated fields do not prevent it
+    from running. Field names are resolved against the schema's declared fields
+    (including inheritance, overrides, and ``data_key``/``attribute`` mappings)
+    when the schema is bound; declaring a nonexistent field raises ``ValueError``.
+
+    A required field that is missing because ``partial`` allowed it to be omitted
+    does not count as valid. By default the validator is skipped in that case.
+    If ``pass_missing=True``, the validator is called anyway and receives a
+    ``missing_fields`` keyword argument containing the names of the required
+    fields that are missing. Fields that failed deserialization or field-level
+    validation still prevent the call.
+
     .. versionchanged:: 3.0.0b1 ``skip_on_field_errors`` defaults to `True`.
     .. versionchanged:: 3.0.0 ``partial`` and ``many`` are always passed as keyword arguments to
         the decorated method.
@@ -120,13 +139,20 @@ def validates_schema(
     .. versionchanged:: 4.0.0 ``pass_many`` is renamed to ``pass_collection``.
     .. versionchanged:: 4.0.0 ``pass_collection``, ``pass_original``, and ``skip_on_field_errors``
         are keyword-only arguments.
+    .. versionchanged:: 4.4.0 Added ``requires`` and ``pass_missing``.
     """
+    if requires is not None:
+        if isinstance(requires, str):
+            raise StringNotCollectionError('"requires" should be a list of strings')
+        requires = tuple(requires)
     return set_hook(
         fn,
         VALIDATES_SCHEMA,
         many=pass_collection,
         pass_original=pass_original,
         skip_on_field_errors=skip_on_field_errors,
+        requires=requires,
+        pass_missing=pass_missing,
     )
 
 
