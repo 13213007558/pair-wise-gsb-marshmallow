@@ -100,6 +100,8 @@ def validates_schema(
     pass_collection: bool = False,
     pass_original: bool = False,
     skip_on_field_errors: bool = True,
+    required_fields: tuple[str, ...] = (),
+    pass_missing: bool = False,
 ) -> typing.Callable[..., typing.Any]:
     """Register a schema-level validator.
 
@@ -113,6 +115,22 @@ def validates_schema(
     If ``skip_on_field_errors=True``, this validation method will be skipped whenever
     validation errors have been detected when validating fields.
 
+    If ``required_fields`` is given, it declares the fields this validator depends on.
+    The validator is only invoked for records where every declared field was
+    successfully deserialized and passed field-level validation; errors on any
+    other field do not prevent it from running. Field names are resolved against
+    the schema's bound fields (honoring inheritance, overrides, and
+    ``data_key``/``attribute`` mappings) when the schema is instantiated, and declaring a
+    field that does not exist raises an error at that point. When
+    ``required_fields`` is declared, it replaces ``skip_on_field_errors`` as the
+    gating mechanism.
+
+    A declared field that is absent from the input but allowed to be missing by
+    ``partial`` loading does not count as successfully validated. By default the
+    validator is skipped in that case. If ``pass_missing=True``, the validator is
+    invoked anyway and receives a ``missing_fields`` keyword argument containing
+    the declared field names that were absent.
+
     .. versionchanged:: 3.0.0b1 ``skip_on_field_errors`` defaults to `True`.
     .. versionchanged:: 3.0.0 ``partial`` and ``many`` are always passed as keyword arguments to
         the decorated method.
@@ -120,13 +138,18 @@ def validates_schema(
     .. versionchanged:: 4.0.0 ``pass_many`` is renamed to ``pass_collection``.
     .. versionchanged:: 4.0.0 ``pass_collection``, ``pass_original``, and ``skip_on_field_errors``
         are keyword-only arguments.
+    .. versionadded:: 4.4.0 ``required_fields`` and ``pass_missing`` parameters.
     """
+    if isinstance(required_fields, str):
+        raise ValueError('"required_fields" should be a collection of strings')
     return set_hook(
         fn,
         VALIDATES_SCHEMA,
         many=pass_collection,
         pass_original=pass_original,
         skip_on_field_errors=skip_on_field_errors,
+        required_fields=tuple(required_fields),
+        pass_missing=pass_missing,
     )
 
 

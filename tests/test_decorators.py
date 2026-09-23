@@ -722,6 +722,242 @@ class TestValidatesSchemaDecorator:
         }
 
 
+class TestValidatesSchemaRequiredFields:
+    class PolicySchema(Schema):
+        starts_at = fields.Date(required=True)
+        ends_at = fields.Date(required=True)
+        phone = fields.Str(required=True, validate=predicate(lambda s: s.isdigit()))
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.calls = []
+
+        @validates_schema(required_fields=("starts_at", "ends_at"))
+        def check_date_order(self, data, **kwargs):
+            self.calls.append(data)
+            if data["ends_at"] < data["starts_at"]:
+                raise ValidationError("ends_at must not be before starts_at")
+
+    def test_unrelated_field_error_does_not_block(self):
+        schema = self.PolicySchema()
+        errors = schema.validate(
+            {"starts_at": "2026-01-02", "ends_at": "2026-01-01", "phone": "abc"}
+        )
+        # The bad phone number is reported, but the date check still ran.
+        assert "phone" in errors
+        assert errors["_schema"] == ["ends_at must not be before starts_at"]
+        assert len(schema.calls) == 1
+
+    def test_error_on_declared_field_skips_validator(self):
+        schema = self.PolicySchema()
+        errors = schema.validate(
+            {"starts_at": "not-a-date", "ends_at": "2026-01-01", "phone": "123"}
+        )
+        assert "starts_at" in errors
+        assert "_schema" not in errors
+        assert schema.calls == []
+
+    def test_field_validation_error_on_declared_field_skips_validator(self):
+        class MySchema(Schema):
+            foo = fields.Int(required=True, validate=validate.Equal(3))
+            bar = fields.Int(required=True)
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.calls = []
+
+            @validates_schema(required_fields=("foo", "bar"))
+            def check(self, data, **kwargs):
+                self.calls.append(data)
+
+        schema = MySchema()
+        errors = schema.validate({"foo": 2, "bar": 2})
+        assert "foo" in errors
+        assert schema.calls == []
+
+    def test_nonexistent_field_raises_at_bind_time(self):
+        class MySchema(Schema):
+            foo = fields.Int()
+
+            @validates_schema(required_fields=("does_not_exist",))
+            def check(self, data, **kwargs): ...
+
+        with pytest.raises(ValueError, match='"does_not_exist" field does not exist'):
+            MySchema()
+
+    def test_string_required_fields_raises(self):
+        with pytest.raises(ValueError, match="collection of strings"):
+
+            @validates_schema(required_fields="foo")
+            def check(self, data, **kwargs): ...
+
+    def test_data_key_and_attribute_mapping(self):
+        class MySchema(Schema):
+            starts_at = fields.Date(
+                required=True, data_key="startsAt", attribute="start"
+            )
+            ends_at = fields.Date(required=True)
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.calls = []
+
+            @validates_schema(required_fields=("starts_at", "ends_at"))
+            def check(self, data, **kwargs):
+                self.calls.append(data)
+
+        schema = MySchema()
+        # Errors are keyed by data_key and block the validator.
+        errors = schema.validate({"startsAt": "bad", "ends_at": "2026-01-01"})
+        assert "startsAt" in errors
+        assert schema.calls == []
+        # The deserialized value is found through the attribute mapping.
+        errors = schema.validate({"startsAt": "2026-01-01", "ends_at": "2026-01-02"})
+        assert errors == {}
+        assert len(schema.calls) == 1
+
+    def test_inherited_and_overridden_fields(self):
+        class BaseSchema(Schema):
+            starts_at = fields.Date(required=True)
+            ends_at = fields.Date(required=True)
+
+            @validates_schema(required_fields=("starts_at", "ends_at"))
+            def check(self, data, **kwargs):
+                raise ValidationError("date check ran")
+
+        class ChildSchema(BaseSchema):
+            ends_at = fields.Date(required=True, data_key="endsAt")
+
+        schema = ChildSchema()
+        # The overridden field's data_key is used for error lookup.
+        errors = schema.validate({"starts_at": "2026-01-01", "endsAt": "bad"})
+        assert errors == {"endsAt": ["Not a valid date."]}
+        errors = schema.validate({"starts_at": "2026-01-01", "endsAt": "2026-01-02"})
+        assert errors == {"_schema": ["date check ran"]}
+
+    def test_many_bad_record_does_not_affect_other_records(self):
+        schema = self.PolicySchema()
+        errors = schema.validate(
+            [
+                {"starts_at": "2026-01-02", "ends_at": "2026-01-03", "phone": "1"},
+                {"starts_at": "bad", "ends_at": "2026-01-03", "phone": "1"},
+                {"starts_at": "2026-02-02", "ends_at": "2026-02-01", "phone": "1"},
+            ],
+            many=True,
+        )
+        # The validator ran for the two valid records only.
+        assert len(schema.calls) == 2
+        assert 0 not in errors
+        assert "starts_at" in errors[1]
+        assert errors[2]["_schema"] == ["ends_at must not be before starts_at"]
+
+    def test_partial_missing_declared_field_skips_by_default(self):
+        schema = self.PolicySchema()
+        errors = schema.validate({"phone": "123"}, partial=True)
+        assert errors == {}
+        assert schema.calls == []
+
+    def test_pass_missing_receives_missing_state(self):
+        class MySchema(Schema):
+            foo = fields.Int(required=True)
+            bar = fields.Int(required=True)
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.seen = []
+
+            @validates_schema(required_fields=("foo", "bar"), pass_missing=True)
+            def check(self, data, missing_fields, **kwargs):
+                self.seen.append(missing_fields)
+
+        schema = MySchema()
+        assert schema.validate({"foo": 1}, partial=True) == {}
+        assert schema.seen == [frozenset({"bar"})]
+        assert schema.validate({"foo": 1, "bar": 2}) == {}
+        assert schema.seen[-1] == frozenset()
+
+    def test_pass_missing_still_skips_on_field_errors(self):
+        class MySchema(Schema):
+            foo = fields.Int(required=True)
+            bar = fields.Int(required=True)
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.seen = []
+
+            @validates_schema(required_fields=("foo", "bar"), pass_missing=True)
+            def check(self, data, missing_fields, **kwargs):
+                self.seen.append(missing_fields)
+
+        schema = MySchema()
+        errors = schema.validate({"foo": "bad", "bar": 2})
+        assert "foo" in errors
+        assert schema.seen == []
+
+    def test_nested_schema(self):
+        class InnerSchema(Schema):
+            x = fields.Int(required=True)
+            y = fields.Int(required=True)
+
+            @validates_schema(required_fields=("x", "y"))
+            def check(self, data, **kwargs):
+                if data["x"] > data["y"]:
+                    raise ValidationError("x must be <= y")
+
+        class OuterSchema(Schema):
+            inner = fields.Nested(InnerSchema, required=True)
+            other = fields.Int(required=True)
+
+        errors = OuterSchema().validate({"inner": {"x": 5, "y": 1}, "other": "bad"})
+        # The unrelated outer field error does not block the nested validator.
+        assert "other" in errors
+        assert errors["inner"]["_schema"] == ["x must be <= y"]
+
+    def test_validator_errors_do_not_change_other_validators_readiness(self):
+        class MySchema(Schema):
+            foo = fields.Int()
+            bar = fields.Int()
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.calls = []
+
+            @validates_schema(required_fields=("foo",))
+            def first(self, data, **kwargs):
+                raise ValidationError("boom", "bar")
+
+            @validates_schema(required_fields=("bar",))
+            def second(self, data, **kwargs):
+                self.calls.append(data)
+
+        schema = MySchema()
+        errors = schema.validate({"foo": 1, "bar": 2})
+        assert errors == {"bar": ["boom"]}
+        # Readiness was snapshotted before schema validators ran, so the
+        # error stored by first() does not block second().
+        assert len(schema.calls) == 1
+
+    def test_pass_collection_requires_all_records_ready(self):
+        class MySchema(Schema):
+            foo = fields.Int(required=True)
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.calls = []
+
+            @validates_schema(required_fields=("foo",), pass_collection=True)
+            def check(self, data, **kwargs):
+                self.calls.append(data)
+
+        schema = MySchema()
+        errors = schema.validate([{"foo": 1}, {"foo": "bad"}], many=True)
+        assert "foo" in errors[1]
+        assert schema.calls == []
+        errors = schema.validate([{"foo": 1}, {"foo": 2}], many=True)
+        assert errors == {}
+        assert len(schema.calls) == 1
+
+
 def test_decorator_error_handling():
     class ExampleSchema(Schema):
         foo = fields.Int()

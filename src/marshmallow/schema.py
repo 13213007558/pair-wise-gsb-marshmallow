@@ -43,6 +43,13 @@ if typing.TYPE_CHECKING:
     from marshmallow.fields import Field
 
 
+class _FieldReadiness(typing.NamedTuple):
+    """Snapshot of per-record field presence and field error state."""
+
+    present: frozenset[str] | list[frozenset[str]]
+    errors: frozenset[str] | dict[int, frozenset[str]]
+
+
 def _get_fields(attrs) -> list[tuple[str, Field]]:
     """Get fields from a class
 
@@ -314,6 +321,8 @@ class Schema(metaclass=SchemaMeta):
     opts: typing.Any
     _declared_fields: dict[str, Field] = {}
     _hooks: dict[str, list[tuple[str, bool, dict]]] = {}
+    # Mapping of validates_schema hook name -> resolved (field name, Field) pairs
+    _schema_validator_fields: dict[str, tuple[tuple[str, Field], ...]]
 
     class Meta:
         """Options object for a Schema.
@@ -440,6 +449,7 @@ class Schema(metaclass=SchemaMeta):
         self.load_fields: dict[str, Field] = {}
         self.dump_fields: dict[str, Field] = {}
         self._init_fields()
+        self._schema_validator_fields = self._resolve_schema_validator_fields()
         messages = {}
         messages.update(self._default_error_messages)
         for cls in reversed(self.__class__.__mro__):
@@ -782,14 +792,25 @@ class Schema(metaclass=SchemaMeta):
         unknown: types.UnknownOption | None,
         pass_original: bool,
         index: int | None = None,
+        missing_fields: frozenset[str] | None = None,
     ):
+        extra_kwargs: dict[str, typing.Any] = {}
+        if missing_fields is not None:
+            extra_kwargs["missing_fields"] = missing_fields
         try:
             if pass_original:  # Pass original, raw data (before unmarshalling)
                 validator_func(
-                    output, original_data, partial=partial, many=many, unknown=unknown
+                    output,
+                    original_data,
+                    partial=partial,
+                    many=many,
+                    unknown=unknown,
+                    **extra_kwargs,
                 )
             else:
-                validator_func(output, partial=partial, many=many, unknown=unknown)
+                validator_func(
+                    output, partial=partial, many=many, unknown=unknown, **extra_kwargs
+                )
         except ValidationError as err:
             field_name = err.field_name
             data_key: str
@@ -902,6 +923,11 @@ class Schema(metaclass=SchemaMeta):
             # Run schema-level validation
             if self._hooks[VALIDATES_SCHEMA]:
                 field_errors = bool(error_store.errors)
+                readiness = (
+                    self._snapshot_field_readiness(result, error_store, many=many)
+                    if self._schema_validator_fields
+                    else None
+                )
                 self._invoke_schema_validators(
                     error_store=error_store,
                     pass_collection=True,
@@ -911,6 +937,7 @@ class Schema(metaclass=SchemaMeta):
                     partial=partial,
                     unknown=unknown,
                     field_errors=field_errors,
+                    readiness=readiness,
                 )
                 self._invoke_schema_validators(
                     error_store=error_store,
@@ -921,6 +948,7 @@ class Schema(metaclass=SchemaMeta):
                     partial=partial,
                     unknown=unknown,
                     field_errors=field_errors,
+                    readiness=readiness,
                 )
             errors = error_store.errors
             # Run post processors
@@ -1052,6 +1080,37 @@ class Schema(metaclass=SchemaMeta):
         self.dump_fields = dump_fields
         self.load_fields = load_fields
 
+    def _resolve_schema_validator_fields(
+        self,
+    ) -> dict[str, tuple[tuple[str, Field], ...]]:
+        """Resolve the ``required_fields`` declared by schema-level validators
+        against this schema's bound fields.
+
+        Inheritance, field overrides, and ``data_key``/``attribute`` mappings are
+        accounted for here, at schema binding time. Declaring a field that does
+        not exist raises an error immediately. Fields that are declared on the
+        schema but not bound (e.g. removed by ``only``/``exclude``) resolve to their
+        declared field object; they never appear in deserialized data, so
+        validators depending on them are treated as having missing dependencies.
+
+        This method is private API.
+        """
+        resolved: dict[str, tuple[tuple[str, Field], ...]] = {}
+        for attr_name, _, validator_kwargs in self._hooks[VALIDATES_SCHEMA]:
+            required_fields = validator_kwargs.get("required_fields") or ()
+            if not required_fields:
+                continue
+            fields = []
+            for field_name in required_fields:
+                field_obj = self.fields.get(field_name)
+                if field_obj is None:
+                    field_obj = self.declared_fields.get(field_name)
+                if field_obj is None:
+                    raise ValueError(f'"{field_name}" field does not exist.')
+                fields.append((field_name, field_obj))
+            resolved[attr_name] = tuple(fields)
+        return resolved
+
     def on_bind_field(self, field_name: str, field_obj: Field) -> None:
         """Hook to modify a field when it is bound to the `Schema <marshmallow.Schema>`.
 
@@ -1182,41 +1241,130 @@ class Schema(metaclass=SchemaMeta):
         partial: bool | types.StrSequenceOrSet | None,
         field_errors: bool = False,
         unknown: types.UnknownOption | None,
+        readiness: _FieldReadiness | None = None,
     ):
         for attr_name, hook_many, validator_kwargs in self._hooks[VALIDATES_SCHEMA]:
             if hook_many != pass_collection:
                 continue
             validator = getattr(self, attr_name)
-            if field_errors and validator_kwargs["skip_on_field_errors"]:
-                continue
+            required_fields = self._schema_validator_fields.get(attr_name)
             pass_original = validator_kwargs.get("pass_original", False)
+            pass_missing = validator_kwargs.get("pass_missing", False)
 
             if many and not pass_collection:
-                for idx, (item, orig) in enumerate(
-                    zip(data, original_data, strict=True)
-                ):
-                    self._run_validator(
-                        validator,
-                        item,
-                        original_data=orig,
-                        error_store=error_store,
-                        many=many,
-                        partial=partial,
-                        unknown=unknown,
-                        index=idx,
-                        pass_original=pass_original,
-                    )
+                indexed_items = enumerate(zip(data, original_data, strict=True))
             else:
+                indexed_items = [(None, (data, original_data))]
+
+            for idx, (item, orig) in indexed_items:
+                missing_fields = None
+                if required_fields is None:
+                    if field_errors and validator_kwargs["skip_on_field_errors"]:
+                        continue
+                else:
+                    has_error, missing = self._check_required_fields(
+                        required_fields, readiness, index=idx
+                    )
+                    # A declared field failed to deserialize or failed
+                    # field-level validation: never run the validator.
+                    if has_error:
+                        continue
+                    # Fields allowed missing by partial loading are not
+                    # successfully validated; skip unless the validator
+                    # explicitly opts into receiving the missing state.
+                    if missing and not pass_missing:
+                        continue
+                    if pass_missing:
+                        missing_fields = missing
                 self._run_validator(
                     validator,
-                    data,
-                    original_data=original_data,
+                    item,
+                    original_data=orig,
                     error_store=error_store,
                     many=many,
-                    pass_original=pass_original,
                     partial=partial,
                     unknown=unknown,
+                    index=idx,
+                    pass_original=pass_original,
+                    missing_fields=missing_fields,
                 )
+
+    def _snapshot_field_readiness(
+        self, data, error_store: ErrorStore, *, many: bool
+    ) -> _FieldReadiness:
+        """Capture which field values are present and which fields have errors,
+        per record, before schema-level validators run.
+
+        The snapshot is taken after deserialization and field-level validation,
+        so schema-level validators cannot alter the readiness state observed by
+        other validators. This method is private API.
+        """
+        if many:
+            present: frozenset[str] | list[frozenset[str]] = [
+                frozenset(item) for item in data
+            ]
+            errors: frozenset[str] | dict[int, frozenset[str]]
+            if self.opts.index_errors:
+                errors = {
+                    index: frozenset(item_errors)
+                    for index, item_errors in error_store.errors.items()
+                }
+            else:
+                errors = frozenset(error_store.errors)
+        else:
+            present = frozenset(data)
+            errors = frozenset(error_store.errors)
+        return _FieldReadiness(present, errors)
+
+    @staticmethod
+    def _check_required_fields(
+        required_fields: tuple[tuple[str, Field], ...],
+        readiness: _FieldReadiness,
+        *,
+        index: int | None,
+    ) -> tuple[bool, frozenset[str]]:
+        """Check the readiness of a schema validator's declared fields.
+
+        Return a (has_error, missing_fields) pair for the record at
+        ``index`` (or for the whole data if ``index`` is ``None``).
+        """
+        if isinstance(readiness.present, list):
+            if index is None:
+                # pass_collection validator: all records must be ready.
+                present = (
+                    frozenset.intersection(*readiness.present)
+                    if readiness.present
+                    else frozenset()
+                )
+                if isinstance(readiness.errors, dict):
+                    error_keys = (
+                        frozenset.union(*readiness.errors.values())
+                        if readiness.errors
+                        else frozenset()
+                    )
+                else:
+                    error_keys = readiness.errors
+            else:
+                present = readiness.present[index]
+                if isinstance(readiness.errors, dict):
+                    error_keys = readiness.errors.get(index, frozenset())
+                else:
+                    error_keys = readiness.errors
+        else:
+            present = readiness.present
+            error_keys = typing.cast("frozenset[str]", readiness.errors)
+
+        missing = []
+        for field_name, field_obj in required_fields:
+            data_key = (
+                field_obj.data_key if field_obj.data_key is not None else field_name
+            )
+            if data_key in error_keys:
+                return True, frozenset()
+            key = field_obj.attribute or field_name
+            if key not in present:
+                missing.append(field_name)
+        return False, frozenset(missing)
 
     def _invoke_processors(
         self,

@@ -6,6 +6,11 @@ Changelog
 
 Features:
 
+- Add ``required_fields`` and ``pass_missing`` parameters to
+  `validates_schema <marshmallow.decorators.validates_schema>`.
+  A schema-level validator may now declare the fields it depends on; it is
+  invoked once those fields have deserialized and passed field-level
+  validation, regardless of errors on unrelated fields.
 - Simplify `get_value` to match actual usage (:pr:`3024`).
 
 Bug fixes:
