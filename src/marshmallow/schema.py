@@ -86,6 +86,38 @@ def _get_fields_by_mro(klass: SchemaMeta):
     )
 
 
+def _merge_update(old: typing.Any, patch: typing.Any) -> typing.Any:
+    """Recursively merge a deserialized patch into existing data.
+
+    Mappings are merged key by key; any other value in ``patch`` (including
+    lists and ``None``) replaces the corresponding value in ``old`` wholesale.
+    ``old`` is never mutated: containers along a merge path are shallow-copied,
+    and untouched containers are shared with ``old``.
+    """
+    if isinstance(old, Mapping) and isinstance(patch, Mapping):
+        merged = copy.copy(old)
+        for key, value in patch.items():
+            merged[key] = _merge_update(old[key], value) if key in old else value
+        return merged
+    return patch
+
+
+def _submitted_paths(patch: Mapping[str, typing.Any], prefix: str = "") -> set[str]:
+    """Return the dot-delimited paths of the leaf values in a deserialized patch.
+
+    Non-empty mappings are recursed into; any other value -- including empty
+    mappings and ``None`` -- counts as a submitted leaf.
+    """
+    paths = set()
+    for key, value in patch.items():
+        path = f"{prefix}{key}"
+        if isinstance(value, Mapping) and value:
+            paths.update(_submitted_paths(value, prefix=path + "."))
+        else:
+            paths.add(path)
+    return paths
+
+
 class SchemaMeta(ABCMeta):
     """Metaclass for the Schema class. Binds the declared fields to
     a ``_declared_fields`` attribute, which is a dictionary mapping attribute
@@ -769,6 +801,126 @@ class Schema(metaclass=SchemaMeta):
         """
         data = self.opts.render_module.loads(s, **kwargs)
         return self.load(data, many=many, partial=partial, unknown=unknown)
+
+    def load_update(
+        self,
+        data: Mapping[str, typing.Any],
+        instance: Mapping[str, typing.Any],
+        *,
+        unknown: types.UnknownOption | None = None,
+    ) -> tuple[typing.Any, set[str]]:
+        """Deserialize a partial patch and merge it into existing data.
+
+        This is the update counterpart of :meth:`load`: ``data`` is a raw
+        (e.g. JSON-decoded) patch while ``instance`` holds previously
+        deserialized values. Only the fields submitted in ``data`` are
+        deserialized and field-validated, so values kept from ``instance``
+        are never re-deserialized. The converted patch is then merged into
+        ``instance`` and schema-level validation runs on the merged result.
+
+        Merging is recursive for nested mappings; any other value in the
+        patch -- including lists and ``None`` -- replaces the old value
+        wholesale. A field absent from ``data`` keeps its old value, an
+        explicit ``None`` sets the value to ``None``, and an empty mapping
+        leaves a nested mapping unchanged. ``data_key`` and ``attribute``
+        are honored as in :meth:`load`.
+
+        :param data: The raw patch data to deserialize.
+        :param instance: A mapping of previously deserialized data to update.
+            It is never mutated, even when validation fails; unmodified
+            sub-containers are shared between ``instance`` and the result.
+        :param unknown: Whether to exclude, include, or raise an error for
+            unknown fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
+            If `None`, the value for `self.unknown` is used.
+        :return: A tuple ``(result, paths)`` with the merged, validated data
+            and the set of dot-delimited paths (in attribute space) of the
+            fields that were submitted in ``data``.
+
+        A :exc:`ValidationError <marshmallow.exceptions.ValidationError>` is
+        raised if the patch or the merged data are invalid. Error messages
+        are keyed like the client patch.
+
+        .. versionadded:: 4.4.0
+        """
+        error_store = ErrorStore()
+        errors: dict[str, list[str]] = {}
+        unknown = self.unknown if unknown is None else unknown
+        result: typing.Any = None
+        patch: typing.Any = None
+        # Run preprocessors on the raw patch
+        if self._hooks[PRE_LOAD]:
+            try:
+                processed_data = self._invoke_load_processors(
+                    PRE_LOAD,
+                    data,
+                    many=False,
+                    original_data=data,
+                    partial=True,
+                    unknown=unknown,
+                )
+            except ValidationError as err:
+                errors = err.normalized_messages()
+        else:
+            processed_data = data
+        if not errors:
+            # Deserialize only the submitted patch fields
+            patch = self._deserialize(
+                processed_data,
+                error_store=error_store,
+                many=False,
+                partial=True,
+                unknown=unknown,
+            )
+            # Run field-level validation on the patch
+            self._invoke_field_validators(
+                error_store=error_store, data=patch, many=False
+            )
+            errors = error_store.errors
+            result = patch
+            if not errors:
+                # Merge the converted patch into the existing data
+                result = _merge_update(instance, patch)
+                # Run schema-level validation on the merged result
+                if self._hooks[VALIDATES_SCHEMA]:
+                    self._invoke_schema_validators(
+                        error_store=error_store,
+                        pass_collection=True,
+                        data=result,
+                        original_data=data,
+                        many=False,
+                        partial=None,
+                        unknown=unknown,
+                        field_errors=False,
+                    )
+                    self._invoke_schema_validators(
+                        error_store=error_store,
+                        pass_collection=False,
+                        data=result,
+                        original_data=data,
+                        many=False,
+                        partial=None,
+                        unknown=unknown,
+                        field_errors=False,
+                    )
+                    errors = error_store.errors
+                # Run post processors on the merged result
+                if not errors and self._hooks[POST_LOAD]:
+                    try:
+                        result = self._invoke_load_processors(
+                            POST_LOAD,
+                            result,
+                            many=False,
+                            original_data=data,
+                            partial=None,
+                            unknown=unknown,
+                        )
+                    except ValidationError as err:
+                        errors = err.normalized_messages()
+        if errors:
+            exc = ValidationError(errors, data=data, valid_data=result)
+            self.handle_error(exc, data, many=False, partial=True)
+            raise exc
+        return result, _submitted_paths(patch)
 
     def _run_validator(
         self,
