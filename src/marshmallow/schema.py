@@ -29,8 +29,13 @@ from marshmallow.decorators import (
     VALIDATES,
     VALIDATES_SCHEMA,
 )
-from marshmallow.error_store import ErrorStore
-from marshmallow.exceptions import SCHEMA, StringNotCollectionError, ValidationError
+from marshmallow.error_store import ErrorStore, merge_errors
+from marshmallow.exceptions import (
+    SCHEMA,
+    MarshmallowError,
+    StringNotCollectionError,
+    ValidationError,
+)
 from marshmallow.orderedset import OrderedSet
 from marshmallow.utils import (
     get_value,
@@ -63,6 +68,48 @@ def _get_fields(attrs) -> list[tuple[str, Field]]:
 
 # This function allows Schemas to inherit from non-Schema classes and ensures
 #   inheritance according to the MRO
+class IndexedRows(typing.NamedTuple):
+    """Processed rows paired with a mapping back to their original indices.
+
+    A `pre_load <marshmallow.decorators.pre_load>` processor declared with
+    ``pass_collection=True`` may return an ``IndexedRows`` when loading with
+    `Schema.load_rows` to declare how the processed rows correspond to the
+    input rows. ``index_map[i]`` is the index within the original input of
+    the row at position ``i`` of ``data``.
+
+    Returning a plain collection instead declares that rows were neither
+    reordered, removed, nor added.
+
+    .. versionadded:: 4.4.0
+    """
+
+    data: list
+    index_map: list[int]
+
+
+class RowLoadResult(typing.NamedTuple):
+    """Result of `Schema.load_rows`.
+
+    .. attribute:: rows
+
+        One entry per input row, in the order of the original input. Each
+        entry is the successfully loaded object, a
+        `ValidationError <marshmallow.exceptions.ValidationError>` if the row
+        failed, or `marshmallow.missing` if the row was removed by a
+        collection-level pre-load processor.
+
+    .. attribute:: batch_errors
+
+        Errors that could not be attributed to a single input row, e.g.
+        collection-level validation errors without a row index.
+
+    .. versionadded:: 4.4.0
+    """
+
+    rows: list
+    batch_errors: list[ValidationError]
+
+
 def _get_fields_by_mro(klass: SchemaMeta):
     """Collect fields from a class, following its method resolution order. The
     class itself is excluded from the search; only its parents are checked. Get
@@ -769,6 +816,249 @@ class Schema(metaclass=SchemaMeta):
         """
         data = self.opts.render_module.loads(s, **kwargs)
         return self.load(data, many=many, partial=partial, unknown=unknown)
+
+    def load_rows(
+        self,
+        data: Sequence[Mapping[str, typing.Any]],
+        *,
+        partial: bool | types.StrSequenceOrSet | None = None,
+        unknown: types.UnknownOption | None = None,
+    ) -> RowLoadResult:
+        """Deserialize a collection row by row, tolerating per-row errors.
+
+        Unlike `load` with ``many=True``, this method does not raise when
+        individual rows fail validation. It returns a `RowLoadResult` whose
+        ``rows`` attribute contains, for each row of the input and in the
+        original input order, either the successfully loaded object or the
+        `ValidationError <marshmallow.exceptions.ValidationError>` for that
+        row. Rows that fail never reach `post_load
+        <marshmallow.decorators.post_load>` processing. Errors that cannot be
+        attributed to a single row are returned as ``batch_errors``. The
+        input must be a collection; it is never treated as a single item.
+
+        Each row goes through the regular field deserialization, field and
+        schema validation, and `post_load <marshmallow.decorators.post_load>`
+        processing, with ``many=True`` passed to hooks. Only
+        `ValidationError <marshmallow.exceptions.ValidationError>` is
+        tolerated; any other exception propagates.
+
+        Collection-level hooks follow these conventions:
+
+        - `pre_load <marshmallow.decorators.pre_load>` processors declared
+          with ``pass_collection=True`` that reorder, remove, or add rows
+          must return an `IndexedRows` declaring the mapping back to the
+          original input indices. Returning a plain collection declares an
+          identity mapping; if its length differs from the input, tolerant
+          loading is refused and `MarshmallowError
+          <marshmallow.exceptions.MarshmallowError>` is raised.
+        - `validates_schema <marshmallow.decorators.validates_schema>`
+          validators declared with ``pass_collection=True`` may key their
+          error messages by the index of the row within the collection they
+          receive; those errors are attributed to the corresponding input
+          rows. Errors with any other keys are returned as batch errors.
+        - `post_load <marshmallow.decorators.post_load>` processors declared
+          with ``pass_collection=True`` are not supported and cause
+          `MarshmallowError <marshmallow.exceptions.MarshmallowError>` to be
+          raised.
+
+        :param data: The collection of rows to deserialize.
+        :param partial: Whether to ignore missing fields and not require
+            any fields declared. Propagates down to ``Nested`` fields as well.
+            If its value is an iterable, only missing fields listed in that
+            iterable will be ignored. Use dot delimiters to specify nested
+            fields. If `None`, the value for ``self.partial`` is used.
+        :param unknown: Whether to exclude, include, or raise an error for
+            unknown fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
+            If `None`, the value for ``self.unknown`` is used.
+        :return: A `RowLoadResult` with per-row results and batch errors.
+
+        .. versionadded:: 4.4.0
+        """
+        unknown = self.unknown if unknown is None else unknown
+        if partial is None:
+            partial = self.partial
+        if not is_sequence_but_not_string(data):
+            raise ValidationError([self.error_messages["type"]], data=data)
+        if any(pass_collection for _, pass_collection, _ in self._hooks[POST_LOAD]):
+            raise MarshmallowError(
+                "Schema.load_rows does not support post_load processors "
+                "declared with pass_collection=True."
+            )
+        batch_errors: list[ValidationError] = []
+        rows: list = [missing] * len(data)
+        try:
+            processed, index_map = self._invoke_collection_pre_load(
+                data, partial=partial, unknown=unknown
+            )
+        except ValidationError as err:
+            batch_errors.append(err)
+            return RowLoadResult(rows=[err] * len(data), batch_errors=batch_errors)
+
+        row_errors: dict[int, dict] = {}
+        deserialized: list = []
+        for item, original_index in zip(processed, index_map, strict=True):
+            original_item = data[original_index]
+            error_store = ErrorStore()
+            try:
+                item = self._invoke_processors(
+                    PRE_LOAD,
+                    pass_collection=False,
+                    data=[item],
+                    many=True,
+                    original_data=[original_item],
+                    partial=partial,
+                    unknown=unknown,
+                )[0]
+            except ValidationError as err:
+                row_errors[original_index] = err.normalized_messages()
+                deserialized.append(missing)
+                continue
+            result = self._deserialize(
+                item,
+                error_store=error_store,
+                many=False,
+                partial=partial,
+                unknown=unknown,
+            )
+            self._invoke_field_validators(
+                error_store=error_store, data=result, many=False
+            )
+            if self._hooks[VALIDATES_SCHEMA]:
+                schema_error_store = ErrorStore()
+                self._invoke_schema_validators(
+                    error_store=schema_error_store,
+                    pass_collection=False,
+                    data=[result],
+                    original_data=[original_item],
+                    many=True,
+                    partial=partial,
+                    unknown=unknown,
+                    field_errors=bool(error_store.errors),
+                )
+                if schema_error_store.errors:
+                    # Errors are stored under the index of the row within the
+                    # single-item collection passed above.
+                    error_store.errors = merge_errors(
+                        error_store.errors, schema_error_store.errors.get(0, {})
+                    )
+            if error_store.errors:
+                row_errors[original_index] = error_store.errors
+            deserialized.append(result)
+
+        if any(
+            pass_collection for _, pass_collection, _ in self._hooks[VALIDATES_SCHEMA]
+        ):
+            collection_error_store = ErrorStore()
+            self._invoke_schema_validators(
+                error_store=collection_error_store,
+                pass_collection=True,
+                data=deserialized,
+                original_data=data,
+                many=True,
+                partial=partial,
+                unknown=unknown,
+                field_errors=bool(row_errors),
+            )
+            batch_messages: dict = {}
+            for key, messages in collection_error_store.errors.items():
+                if (
+                    isinstance(key, int)
+                    and not isinstance(key, bool)
+                    and 0 <= key < len(index_map)
+                ):
+                    original_index = index_map[key]
+                    row_errors[original_index] = merge_errors(
+                        row_errors.get(original_index, {}), messages
+                    )
+                else:
+                    batch_messages = merge_errors(batch_messages, {key: messages})
+            if batch_messages:
+                batch_errors.append(ValidationError(batch_messages, data=data))
+
+        for position, original_index in enumerate(index_map):
+            valid_data = deserialized[position]
+            if original_index in row_errors:
+                rows[original_index] = ValidationError(
+                    row_errors[original_index],
+                    data=data[original_index],
+                    valid_data=None if valid_data is missing else valid_data,
+                )
+                continue
+            try:
+                rows[original_index] = self._invoke_processors(
+                    POST_LOAD,
+                    pass_collection=False,
+                    data=[valid_data],
+                    many=True,
+                    original_data=[data[original_index]],
+                    partial=partial,
+                    unknown=unknown,
+                )[0]
+            except ValidationError as err:
+                rows[original_index] = ValidationError(
+                    err.normalized_messages(),
+                    data=data[original_index],
+                    valid_data=valid_data,
+                )
+        return RowLoadResult(rows=rows, batch_errors=batch_errors)
+
+    def _invoke_collection_pre_load(
+        self,
+        data: Sequence[Mapping[str, typing.Any]],
+        *,
+        partial: bool | types.StrSequenceOrSet | None,
+        unknown: types.UnknownOption | None,
+    ) -> tuple[list, list[int]]:
+        """Run ``pre_load(pass_collection=True)`` processors for `load_rows`.
+
+        Returns the processed rows and a list mapping each processed row to
+        its index in the original input.
+        """
+        index_map = list(range(len(data)))
+        processed = data
+        for attr_name, pass_collection, processor_kwargs in self._hooks[PRE_LOAD]:
+            if not pass_collection:
+                continue
+            processor = getattr(self, attr_name)
+            if processor_kwargs.get("pass_original", False):
+                processed = processor(
+                    processed, data, many=True, partial=partial, unknown=unknown
+                )
+            else:
+                processed = processor(
+                    processed, many=True, partial=partial, unknown=unknown
+                )
+            if isinstance(processed, IndexedRows):
+                row_map = processed.index_map
+                processed = processed.data
+                if len(row_map) != len(processed) or any(
+                    not isinstance(i, int)
+                    or isinstance(i, bool)
+                    or i < 0
+                    or i >= len(index_map)
+                    for i in row_map
+                ):
+                    raise MarshmallowError(
+                        f"Invalid index_map returned by {attr_name!r}: it must "
+                        "contain one valid row index per processed row."
+                    )
+                index_map = [index_map[i] for i in row_map]
+            elif not is_sequence_but_not_string(processed):
+                raise ValidationError([self.error_messages["type"]], data=data)
+            elif len(processed) != len(index_map):
+                raise MarshmallowError(
+                    f"pre_load processor {attr_name!r} changed the number of "
+                    "rows without declaring a mapping to the original rows. "
+                    "Processors that reorder, remove, or add rows must return "
+                    "IndexedRows(data, index_map) to be used with "
+                    "Schema.load_rows."
+                )
+        if len(set(index_map)) != len(index_map):
+            raise MarshmallowError(
+                "pre_load processors produced a row mapping with duplicate "
+                "source rows, which is not supported by Schema.load_rows."
+            )
+        return processed, index_map
 
     def _run_validator(
         self,

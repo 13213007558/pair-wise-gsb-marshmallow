@@ -6,6 +6,13 @@ Changelog
 
 Features:
 
+- Add `Schema.load_rows <marshmallow.Schema.load_rows>` for row-by-row
+  fault-tolerant loading of collections. It returns a
+  `RowLoadResult <marshmallow.RowLoadResult>` with one entry per input row
+  (the loaded object or that row's error) in input order, plus batch-level
+  errors. Collection-level ``pre_load`` processors that reorder or remove
+  rows declare their row mapping with `IndexedRows <marshmallow.IndexedRows>`.
+
 - Simplify `get_value` to match actual usage (:pr:`3024`).
 
 Bug fixes:
