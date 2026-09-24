@@ -29,8 +29,13 @@ from marshmallow.decorators import (
     VALIDATES,
     VALIDATES_SCHEMA,
 )
-from marshmallow.error_store import ErrorStore
-from marshmallow.exceptions import SCHEMA, StringNotCollectionError, ValidationError
+from marshmallow.error_store import ErrorStore, merge_errors
+from marshmallow.exceptions import (
+    SCHEMA,
+    MarshmallowError,
+    StringNotCollectionError,
+    ValidationError,
+)
 from marshmallow.orderedset import OrderedSet
 from marshmallow.utils import (
     get_value,
@@ -41,6 +46,55 @@ from marshmallow.utils import (
 
 if typing.TYPE_CHECKING:
     from marshmallow.fields import Field
+
+
+class IndexedRows(typing.NamedTuple):
+    """Wrapper that collection-level processing hooks (e.g.
+    ``pre_load(pass_collection=True)``) may return to declare how the
+    returned rows map back to the rows the hook received.
+
+    This is required by `Schema.load_rows` whenever a collection-level hook
+    reorders or removes rows; without it, per-row results could not be traced
+    back to the original input and tolerant loading is refused.
+
+    When returned from a hook during a regular `Schema.load` call, the
+    wrapper is transparently unwrapped and only ``items`` is used.
+    """
+
+    items: Sequence[typing.Any]
+    """The processed rows."""
+    indices: Sequence[int]
+    """``indices[i]`` is the position of ``items[i]`` in the sequence the
+    hook received."""
+
+
+class RowResult(typing.NamedTuple):
+    """Outcome of loading a single input row with `Schema.load_rows`."""
+
+    value: typing.Any = None
+    """The object constructed for the row, or `None` if the row failed or was
+    dropped by collection-level preprocessing."""
+    error: ValidationError | None = None
+    """The error for the row, or `None` if the row was loaded successfully."""
+
+    @property
+    def ok(self) -> bool:
+        """Whether the row passed validation and object construction."""
+        return self.error is None
+
+
+class TolerantLoadResult(typing.NamedTuple):
+    """Result of `Schema.load_rows`."""
+
+    rows: list[RowResult]
+    """Per-row outcomes, aligned with the original input order."""
+    errors: list[typing.Any]
+    """Batch-level error messages that could not be attributed to a single row."""
+
+    @property
+    def ok(self) -> bool:
+        """Whether every row loaded successfully and there are no batch errors."""
+        return not self.errors and all(row.ok for row in self.rows)
 
 
 def _get_fields(attrs) -> list[tuple[str, Field]]:
@@ -770,6 +824,214 @@ class Schema(metaclass=SchemaMeta):
         data = self.opts.render_module.loads(s, **kwargs)
         return self.load(data, many=many, partial=partial, unknown=unknown)
 
+    def load_rows(
+        self,
+        data: Sequence[Mapping[str, typing.Any]],
+        *,
+        partial: bool | types.StrSequenceOrSet | None = None,
+        unknown: types.UnknownOption | None = None,
+    ) -> TolerantLoadResult:
+        """Deserialize a collection of data, tolerating per-row errors.
+
+        Unlike ``load(data, many=True)``, a row that fails validation does not
+        abort the whole batch. Every row goes through the regular field
+        deserialization, field/schema validation, and ``post_load``
+        processing; rows that fail any step never reach object construction.
+        A `ValidationError` raised by a ``post_load`` hook marks only that
+        row. Any other exception raised by hooks or validators propagates.
+
+        The result contains one `RowResult` per input row, in the original
+        input order, holding either the constructed object or the row's error.
+        Errors that cannot be attributed to a single row (e.g. raised by
+        collection-level hooks without a row index) are reported as
+        batch-level errors in `TolerantLoadResult.errors`.
+
+        Collection-level hooks (``pass_collection=True``) participate as
+        follows:
+
+        - ``pre_load`` hooks that reorder or remove rows must return
+          `IndexedRows` to declare the mapping back to the original input
+          positions, otherwise a `MarshmallowError` is raised.
+        - ``validates_schema`` hooks receive the deserialized rows and may
+          raise `ValidationError` with a dict keyed by row position to
+          attribute errors to specific rows; other messages become
+          batch-level errors.
+        - ``post_load`` hooks receive the successfully constructed objects
+          in original input order and must preserve the row count (or return
+          `IndexedRows`); `ValidationError` messages become batch-level
+          errors.
+
+        :param data: The collection of data to deserialize.
+        :param partial: Whether to ignore missing fields and not require
+            any fields declared. Propagates down to ``Nested`` fields as well. If
+            its value is an iterable, only missing fields listed in that iterable
+            will be ignored. Use dot delimiters to specify nested fields.
+        :param unknown: Whether to exclude, include, or raise an error for unknown
+            fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
+            If `None`, the value for `self.unknown` is used.
+        :return: A `TolerantLoadResult` with per-row outcomes and batch errors.
+
+        .. versionadded:: 4.4.0
+        """
+        unknown = self.unknown if unknown is None else unknown
+        if partial is None:
+            partial = self.partial
+
+        if not is_sequence_but_not_string(data):
+            return TolerantLoadResult(
+                rows=[], errors=[{SCHEMA: [self.error_messages["type"]]}]
+            )
+        data = list(data)
+        batch_errors: list[typing.Any] = []
+
+        # Collection-level preprocessing. Hooks that reorder or remove rows
+        # must return IndexedRows so rows can be traced back to the input.
+        try:
+            processed, index_map = self._pre_load_collection(
+                data, partial=partial, unknown=unknown
+            )
+        except ValidationError as err:
+            return TolerantLoadResult(rows=[], errors=[err.normalized_messages()])
+
+        row_errors: dict[int, typing.Any] = {}
+        values: list[typing.Any] = []
+        value_origs: list[int] = []
+
+        # Per-row preprocessing, deserialization, and field validation.
+        for pos, item in enumerate(processed):
+            orig = index_map[pos]
+            error_store = ErrorStore()
+            try:
+                item = self._run_item_processors(
+                    PRE_LOAD,
+                    item,
+                    original=data[orig],
+                    partial=partial,
+                    unknown=unknown,
+                )
+            except ValidationError as err:
+                row_errors[orig] = err.normalized_messages()
+                continue
+            value = self._deserialize(
+                item,
+                error_store=error_store,
+                many=False,
+                partial=partial,
+                unknown=unknown,
+            )
+            self._invoke_field_validators(
+                error_store=error_store, data=value, many=False
+            )
+            if error_store.errors:
+                row_errors[orig] = error_store.errors
+            values.append(value)
+            value_origs.append(orig)
+
+        field_errors = bool(row_errors)
+
+        # Collection-level schema validation. Integer keys in raised errors
+        # refer to positions in ``values`` and are attributed back to rows.
+        for attr_name, hook_many, validator_kwargs in self._hooks[VALIDATES_SCHEMA]:
+            if not hook_many:
+                continue
+            if field_errors and validator_kwargs["skip_on_field_errors"]:
+                continue
+            validator = getattr(self, attr_name)
+            try:
+                if validator_kwargs.get("pass_original"):
+                    validator(values, data, partial=partial, many=True, unknown=unknown)
+                else:
+                    validator(values, partial=partial, many=True, unknown=unknown)
+            except ValidationError as err:
+                self._attribute_collection_error(
+                    err, value_origs, row_errors=row_errors, batch_errors=batch_errors
+                )
+
+        # Per-row schema validation.
+        for attr_name, hook_many, validator_kwargs in self._hooks[VALIDATES_SCHEMA]:
+            if hook_many:
+                continue
+            if field_errors and validator_kwargs["skip_on_field_errors"]:
+                continue
+            validator = getattr(self, attr_name)
+            pass_original = validator_kwargs.get("pass_original", False)
+            for value, orig in zip(values, value_origs):
+                error_store = ErrorStore()
+                self._run_validator(
+                    validator,
+                    value,
+                    original_data=data[orig],
+                    error_store=error_store,
+                    many=True,
+                    partial=partial,
+                    unknown=unknown,
+                    pass_original=pass_original,
+                )
+                if error_store.errors:
+                    row_errors[orig] = merge_errors(
+                        row_errors.get(orig, {}), error_store.errors
+                    )
+
+        # Object construction. Failed rows never enter post_load processing;
+        # a ValidationError marks only that row, other exceptions propagate.
+        objects: dict[int, typing.Any] = {}
+        for value, orig in zip(values, value_origs):
+            if orig in row_errors:
+                continue
+            try:
+                objects[orig] = self._run_item_processors(
+                    POST_LOAD,
+                    value,
+                    original=data[orig],
+                    partial=partial,
+                    unknown=unknown,
+                )
+            except ValidationError as err:
+                row_errors[orig] = err.normalized_messages()
+
+        # Collection-level post-processing over the successfully constructed
+        # objects, in original input order.
+        if objects and any(hook_many for _, hook_many, _ in self._hooks[POST_LOAD]):
+            object_origs = [orig for orig in range(len(data)) if orig in objects]
+            object_list = [objects[orig] for orig in object_origs]
+            try:
+                for attr_name, hook_many, processor_kwargs in self._hooks[POST_LOAD]:
+                    if not hook_many:
+                        continue
+                    processor = getattr(self, attr_name)
+                    if processor_kwargs.get("pass_original"):
+                        result = processor(
+                            object_list,
+                            data,
+                            many=True,
+                            partial=partial,
+                            unknown=unknown,
+                        )
+                    else:
+                        result = processor(
+                            object_list, many=True, partial=partial, unknown=unknown
+                        )
+                    object_list, object_origs = self._remap_rows(
+                        result, object_origs, hook_name=attr_name
+                    )
+            except ValidationError as err:
+                batch_errors.append(err.normalized_messages())
+            else:
+                objects = dict(zip(object_origs, object_list))
+
+        rows: list[RowResult] = []
+        for orig in range(len(data)):
+            if orig in row_errors:
+                rows.append(
+                    RowResult(error=ValidationError(row_errors[orig], data=data[orig]))
+                )
+            elif orig in objects:
+                rows.append(RowResult(value=objects[orig]))
+            else:
+                # The row was dropped by collection-level preprocessing.
+                rows.append(RowResult())
+        return TolerantLoadResult(rows=rows, errors=batch_errors)
+
     def _run_validator(
         self,
         validator_func: types.SchemaValidator,
@@ -886,6 +1148,10 @@ class Schema(metaclass=SchemaMeta):
                 result: list | dict | None = None
         else:
             processed_data = data
+        if not errors and isinstance(processed_data, IndexedRows):
+            # Hooks may declare an index mapping for `load_rows`; a regular
+            # load only needs the items.
+            processed_data = processed_data.items
         if not errors:
             # Deserialize data
             result = self._deserialize(
@@ -942,6 +1208,122 @@ class Schema(metaclass=SchemaMeta):
             raise exc
 
         return result
+
+    def _pre_load_collection(
+        self,
+        data: list[typing.Any],
+        *,
+        partial: bool | types.StrSequenceOrSet | None,
+        unknown: types.UnknownOption,
+    ) -> tuple[list[typing.Any], list[int]]:
+        """Run collection-level ``pre_load`` hooks for `load_rows`.
+
+        Returns the processed rows along with a map of processed positions to
+        original input indices.
+        """
+        index_map = list(range(len(data)))
+        processed: typing.Any = data
+        for attr_name, hook_many, processor_kwargs in self._hooks[PRE_LOAD]:
+            if not hook_many:
+                continue
+            processor = getattr(self, attr_name)
+            if processor_kwargs.get("pass_original"):
+                result = processor(
+                    processed, data, many=True, partial=partial, unknown=unknown
+                )
+            else:
+                result = processor(
+                    processed, many=True, partial=partial, unknown=unknown
+                )
+            processed, index_map = self._remap_rows(
+                result, index_map, hook_name=attr_name
+            )
+        return processed, index_map
+
+    def _run_item_processors(
+        self,
+        tag: str,
+        item: typing.Any,
+        *,
+        original: typing.Any,
+        partial: bool | types.StrSequenceOrSet | None,
+        unknown: types.UnknownOption,
+    ) -> typing.Any:
+        """Run the per-item (``pass_collection=False``) hooks registered under
+        ``tag`` on a single row, as part of `load_rows`."""
+        for attr_name, hook_many, processor_kwargs in self._hooks[tag]:
+            if hook_many:
+                continue
+            processor = getattr(self, attr_name)
+            if processor_kwargs.get("pass_original"):
+                item = processor(
+                    item, original, many=True, partial=partial, unknown=unknown
+                )
+            else:
+                item = processor(item, many=True, partial=partial, unknown=unknown)
+        return item
+
+    @staticmethod
+    def _remap_rows(
+        result: typing.Any, index_map: list[int], *, hook_name: str
+    ) -> tuple[list[typing.Any], list[int]]:
+        """Resolve the rows returned by a collection-level hook against the
+        current index map, for `load_rows`."""
+        if isinstance(result, IndexedRows):
+            items = list(result.items)
+            indices = list(result.indices)
+            if len(indices) != len(items) or any(
+                not isinstance(i, int)
+                or isinstance(i, bool)
+                or i < 0
+                or i >= len(index_map)
+                for i in indices
+            ):
+                raise MarshmallowError(
+                    f"Collection-level hook {hook_name!r} returned an invalid "
+                    "index mapping. `IndexedRows.indices` must contain one "
+                    "position in the received collection per returned row."
+                )
+            return items, [index_map[i] for i in indices]
+        if not is_sequence_but_not_string(result):
+            raise MarshmallowError(
+                f"Collection-level hook {hook_name!r} returned a non-sequence, "
+                "which is incompatible with `load_rows`."
+            )
+        if len(result) != len(index_map):
+            raise MarshmallowError(
+                f"Collection-level hook {hook_name!r} changed the number of rows "
+                "without declaring how rows map back to the input, so tolerant "
+                "row loading is refused. Return "
+                "`marshmallow.IndexedRows(items, indices)` from hooks that "
+                "reorder or remove rows."
+            )
+        return list(result), index_map
+
+    @staticmethod
+    def _attribute_collection_error(
+        error: ValidationError,
+        value_origs: list[int],
+        *,
+        row_errors: dict[int, typing.Any],
+        batch_errors: list[typing.Any],
+    ) -> None:
+        """Attribute a collection-level validation error to individual rows
+        (via integer message keys) or to the batch, for `load_rows`."""
+        messages = error.messages
+        if isinstance(messages, dict):
+            for key, msgs in messages.items():
+                if (
+                    isinstance(key, int)
+                    and not isinstance(key, bool)
+                    and 0 <= key < len(value_origs)
+                ):
+                    orig = value_origs[key]
+                    row_errors[orig] = merge_errors(row_errors.get(orig, {}), msgs)
+                else:
+                    batch_errors.append({key: msgs})
+        else:
+            batch_errors.append(messages)
 
     def _normalize_nested_options(self) -> None:
         """Apply then flatten nested schema options.

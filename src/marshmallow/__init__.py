@@ -8,7 +8,13 @@ from marshmallow.decorators import (
     validates_schema,
 )
 from marshmallow.exceptions import ValidationError
-from marshmallow.schema import Schema, SchemaOpts
+from marshmallow.schema import (
+    IndexedRows,
+    RowResult,
+    Schema,
+    SchemaOpts,
+    TolerantLoadResult,
+)
 
 from . import fields
 
@@ -16,8 +22,11 @@ __all__ = [
     "EXCLUDE",
     "INCLUDE",
     "RAISE",
+    "IndexedRows",
+    "RowResult",
     "Schema",
     "SchemaOpts",
+    "TolerantLoadResult",
     "ValidationError",
     "fields",
     "missing",

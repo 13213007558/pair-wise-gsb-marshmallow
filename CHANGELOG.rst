@@ -7,6 +7,14 @@ Changelog
 Features:
 
 - Simplify `get_value` to match actual usage (:pr:`3024`).
+- Add `Schema.load_rows <marshmallow.Schema.load_rows>`, an explicit
+  row-tolerant loading mode that returns one
+  `RowResult <marshmallow.RowResult>` per input row (in original input
+  order) instead of aborting the batch on the first invalid row.
+  Collection-level hooks that reorder or remove rows must declare an index
+  mapping with `IndexedRows <marshmallow.IndexedRows>`; unattributable
+  collection-level errors are reported as batch errors on
+  `TolerantLoadResult <marshmallow.TolerantLoadResult>`.
 
 Bug fixes:
 
