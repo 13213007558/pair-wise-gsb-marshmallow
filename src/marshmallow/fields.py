@@ -75,6 +75,7 @@ __all__ = [
     "Raw",
     "Str",
     "String",
+    "TaggedUnion",
     "Time",
     "TimeDelta",
     "Tuple",
@@ -727,6 +728,220 @@ class Pluck(Nested):
         else:
             value = {self._field_data_key: value}
         return self._load(value, partial=partial)
+
+
+class TaggedUnion(Field):
+    """A field that selects one of several sub-schemas based on a type tag,
+    for deserializing polymorphic or "tagged union" data structures.
+
+    The tag may be declared in exactly one of two ways:
+
+    - ``tag_path``: a (possibly dot-delimited) path to the tag within the
+      nested object itself, e.g. ``"kind"`` or ``"meta.kind"``.
+    - ``tag_field``: the name of a sibling field on the *outer* record that
+      holds the tag for the nested object.
+
+    Passing both (or neither) raises a `ValueError`.
+
+    Example: ::
+
+        class ShellTask(Schema):
+            command = fields.Str(required=True)
+
+
+        class HttpTask(Schema):
+            url = fields.Str(required=True)
+
+
+        class TaskEnvelope(Schema):
+            kind = fields.Str()
+            payload = fields.TaggedUnion(
+                {"shell": ShellTask, "http": HttpTask},
+                tag_field="kind",
+            )
+
+    Only the schema branch selected by the tag is instantiated and run,
+    for both loading and dumping. An unknown or missing tag raises a
+    `ValidationError <marshmallow.exceptions.ValidationError>` keyed at the
+    tag's location.
+
+    :param schemas: Mapping of tag value to the schema to use for that tag.
+        Values may be `Schema <marshmallow.Schema>` instances, classes,
+        class name strings, dictionaries, or callables returning one of those
+        (same as `Nested <marshmallow.fields.Nested>`). Schemas are
+        instantiated lazily: a branch is only resolved when its tag is
+        selected.
+    :param tag_path: Path to the tag within the nested object. Dot-delimited
+        paths are supported, e.g. ``"meta.kind"``. Mutually exclusive with
+        ``tag_field``.
+    :param tag_field: Name of a field on the outer record that holds the tag.
+        On load, the tag is read from the raw input data; on dump, it is read
+        from the parent object. Mutually exclusive with ``tag_path``.
+    :param many: Whether the field value is a collection of tagged objects.
+        Each item's tag is resolved independently, and errors are keyed by
+        the item's index in the collection.
+    :param unknown: Whether to exclude, include, or raise an error for unknown
+        fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
+    :param kwargs: The same keyword arguments that :class:`Field` receives.
+
+    .. versionadded:: 4.4.0
+    """
+
+    #: Default error messages.
+    default_error_messages = {
+        "type": "Invalid type.",
+        "missing_tag": "Missing tag.",
+        "unknown_tag": "Unknown tag: {tag!r}.",
+    }
+
+    def __init__(
+        self,
+        schemas: _Mapping[
+            str,
+            Schema
+            | SchemaMeta
+            | str
+            | dict[str, Field]
+            | typing.Callable[[], Schema | SchemaMeta | str | dict[str, Field]],
+        ],
+        *,
+        tag_path: str | None = None,
+        tag_field: str | None = None,
+        many: bool = False,
+        unknown: types.UnknownOption | None = None,
+        **kwargs: Unpack[_BaseFieldKwargs],
+    ):
+        if (tag_path is None) == (tag_field is None):
+            raise ValueError(
+                "Exactly one of `tag_path` or `tag_field` must be provided."
+            )
+        if not isinstance(schemas, _Mapping) or not schemas:
+            raise ValueError(
+                "`schemas` must be a non-empty mapping of tag values to schemas."
+            )
+        self.schemas = dict(schemas)
+        self.tag_path = tag_path
+        self.tag_field = tag_field
+        self.many = many
+        self.unknown = unknown
+        self._schema_cache: dict[typing.Any, Schema] = {}
+        super().__init__(**kwargs)
+
+    @property
+    def _tag_location(self) -> str:
+        return self.tag_path if self.tag_path is not None else self.tag_field
+
+    def _tag_error(self, key: str, **fmt_kwargs) -> ValidationError:
+        """Build a `ValidationError` keyed at the tag's location."""
+        message = self.error_messages[key].format(**fmt_kwargs)
+        errors: list | dict = [message]
+        for part in reversed(self._tag_location.split(".")):
+            errors = {part: errors}
+        return ValidationError(errors)
+
+    def _extract_tag(self, item: typing.Any, container: typing.Any) -> typing.Any:
+        """Read the tag from the nested object or the outer record."""
+        source = item if self.tag_path is not None else container
+        tag = (
+            utils.get_value(source, self._tag_location, missing_)
+            if source is not None
+            else missing_
+        )
+        if tag is missing_ or tag is None:
+            raise self._tag_error("missing_tag")
+        return tag
+
+    def _get_schema(self, tag: typing.Any) -> Schema:
+        """Return the schema for ``tag``, resolving it lazily on first use."""
+        try:
+            schema = self._schema_cache.get(tag)
+        except TypeError:  # unhashable tag value
+            raise self._tag_error("unknown_tag", tag=tag) from None
+        if schema is None:
+            try:
+                nested = self.schemas[tag]
+            except (KeyError, TypeError):
+                raise self._tag_error("unknown_tag", tag=tag) from None
+            schema = self._make_schema(nested)
+            self._schema_cache[tag] = schema
+        return schema
+
+    def _make_schema(self, nested) -> Schema:
+        # defer the import of `marshmallow.schema` to avoid circular imports
+        from marshmallow.schema import Schema, SchemaMeta  # noqa: PLC0415
+
+        if callable(nested) and not isinstance(nested, SchemaMeta):
+            nested = nested()
+        if isinstance(nested, dict):
+            nested = Schema.from_dict(nested)
+        if isinstance(nested, Schema):
+            return nested
+        if isinstance(nested, type) and issubclass(nested, Schema):
+            schema_class: type[Schema] = nested
+        elif not isinstance(nested, (str, bytes)):
+            raise ValueError(
+                "`TaggedUnion` schema branches must be a "
+                f"`Schema`, not {nested.__class__}."
+            )
+        else:
+            schema_class = class_registry.get_class(nested, all=False)
+        return schema_class(
+            load_only=self._nested_normalized_option("load_only"),
+            dump_only=self._nested_normalized_option("dump_only"),
+        )
+
+    def _nested_normalized_option(self, option_name: str) -> list[str]:
+        nested_field = f"{self.name}."
+        return [
+            field.split(nested_field, 1)[1]
+            for field in getattr(self.root, option_name, set())
+            if field.startswith(nested_field)
+        ]
+
+    def _load_one(self, item: typing.Any, data, partial) -> typing.Any:
+        tag = self._extract_tag(item, data)
+        schema = self._get_schema(tag)
+        return schema.load(item, unknown=self.unknown, partial=partial)
+
+    def _dump_one(self, item: typing.Any, obj: typing.Any) -> typing.Any:
+        tag = self._extract_tag(item, obj)
+        return self._get_schema(tag).dump(item)
+
+    def _serialize(self, value, attr, obj, **kwargs):
+        if value is None:
+            return None
+        if self.many:
+            return [self._dump_one(each, obj) for each in value]
+        return self._dump_one(value, obj)
+
+    def _deserialize(
+        self,
+        value: typing.Any,
+        attr: str | None,
+        data: typing.Mapping[str, typing.Any] | None,
+        partial: bool | types.StrSequenceOrSet | None = None,  # noqa: FBT001
+        **kwargs,
+    ):
+        """Same as :meth:`Field._deserialize` with additional ``partial`` argument.
+
+        :param partial: For nested schemas, the ``partial``
+            parameter passed to `marshmallow.Schema.load`.
+        """
+        if not self.many:
+            return self._load_one(value, data, partial)
+        if not utils.is_collection(value):
+            raise self.make_error("type", input=value, type=value.__class__.__name__)
+        result = []
+        errors = {}
+        for idx, item in enumerate(value):
+            try:
+                result.append(self._load_one(item, data, partial))
+            except ValidationError as error:
+                errors[idx] = error.messages
+                result.append(error.valid_data)
+        if errors:
+            raise ValidationError(errors, valid_data=result)
+        return result
 
 
 class List(Field[list[_InternalT | None]]):

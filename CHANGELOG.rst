@@ -6,6 +6,11 @@ Changelog
 
 Features:
 
+- Add `fields.TaggedUnion <marshmallow.fields.TaggedUnion>`, a field that
+  selects one of several sub-schemas based on a type tag. The tag is read
+  either from a path within the nested object (``tag_path``) or from a field
+  on the outer record (``tag_field``). Only the selected branch is
+  instantiated and run, for both loading and dumping.
 - Simplify `get_value` to match actual usage (:pr:`3024`).
 
 Bug fixes:
