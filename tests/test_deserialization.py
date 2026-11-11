@@ -2397,3 +2397,157 @@ def test_deserialize_raises_exception_if_input_type_is_incorrect(data, unknown):
     exc = excinfo.value
     assert isinstance(exc.messages, dict)
     assert list(exc.messages.keys()) == ["_schema"]
+
+
+class TestRejectDumpOnly:
+    class AuditSchema(Schema):
+        created_at = fields.DateTime(dump_only=True, data_key="createdAt")
+        updated_by = fields.String(dump_only=True)
+
+        class Meta:
+            unknown = INCLUDE
+            reject_dump_only = True
+
+    class LenientAuditSchema(Schema):
+        created_at = fields.DateTime(dump_only=True, data_key="createdAt")
+
+        class Meta:
+            unknown = INCLUDE
+
+    def test_data_key_alias_is_rejected(self):
+        schema = self.AuditSchema()
+        with pytest.raises(ValidationError) as excinfo:
+            schema.load({"createdAt": "not-a-date", "extra": "keep me"})
+        assert excinfo.value.messages == {"createdAt": ["Read-only field."]}
+        # Unrelated extension keys are still included per `unknown=INCLUDE`
+        assert excinfo.value.valid_data == {"extra": "keep me"}
+
+    def test_attribute_name_is_rejected_when_data_key_is_set(self):
+        schema = self.AuditSchema()
+        with pytest.raises(ValidationError) as excinfo:
+            schema.load({"created_at": "not-a-date"})
+        assert excinfo.value.messages == {"created_at": ["Read-only field."]}
+        assert excinfo.value.valid_data == {}
+
+    def test_dump_only_field_without_data_key_is_rejected(self):
+        schema = self.AuditSchema()
+        with pytest.raises(ValidationError) as excinfo:
+            schema.load({"updated_by": "mallory"})
+        assert excinfo.value.messages == {"updated_by": ["Read-only field."]}
+        assert excinfo.value.valid_data == {}
+
+    def test_rejected_keys_are_not_silently_dropped_with_exclude(self):
+        schema = self.AuditSchema(unknown=EXCLUDE)
+        with pytest.raises(ValidationError) as excinfo:
+            schema.load({"createdAt": "not-a-date", "extra": "dropped"})
+        assert excinfo.value.messages == {"createdAt": ["Read-only field."]}
+        # Unrelated extension keys are still excluded per `unknown=EXCLUDE`
+        assert excinfo.value.valid_data == {}
+
+    def test_read_only_message_takes_precedence_with_raise(self):
+        schema = self.AuditSchema(unknown=RAISE)
+        with pytest.raises(ValidationError) as excinfo:
+            schema.load({"createdAt": "not-a-date", "other": "x"})
+        assert excinfo.value.messages == {
+            "createdAt": ["Read-only field."],
+            "other": ["Unknown field."],
+        }
+
+    def test_constructor_kwarg_enables_policy(self):
+        class PlainSchema(Schema):
+            version = fields.Integer(dump_only=True)
+
+            class Meta:
+                unknown = INCLUDE
+
+        schema = PlainSchema(reject_dump_only=True)
+        with pytest.raises(ValidationError) as excinfo:
+            schema.load({"version": 3})
+        assert excinfo.value.messages == {"version": ["Read-only field."]}
+
+    def test_constructor_kwarg_disables_meta_policy(self):
+        schema = self.AuditSchema(reject_dump_only=False)
+        # Falls back to the pre-existing `unknown=INCLUDE` contract
+        assert schema.load({"createdAt": "not-a-date"}) == {"createdAt": "not-a-date"}
+
+    def test_nested_schema_with_policy_reports_nested_path(self):
+        class ParentSchema(Schema):
+            name = fields.String(required=True)
+            audit = fields.Nested(self.AuditSchema)
+
+            class Meta:
+                unknown = INCLUDE
+                reject_dump_only = True
+
+        schema = ParentSchema()
+        with pytest.raises(ValidationError) as excinfo:
+            schema.load(
+                {
+                    "name": "n",
+                    "audit": {"createdAt": "not-a-date", "note": "ok"},
+                }
+            )
+        assert excinfo.value.messages == {
+            "audit": {"createdAt": ["Read-only field."]}
+        }
+        assert excinfo.value.valid_data == {"name": "n", "audit": {"note": "ok"}}
+
+    def test_nested_schema_without_policy_keeps_own_contract(self):
+        class ParentSchema(Schema):
+            audit = fields.Nested(self.LenientAuditSchema)
+
+            class Meta:
+                unknown = INCLUDE
+                reject_dump_only = True
+
+        schema = ParentSchema()
+        # The nested schema's own configuration governs its input
+        assert schema.load({"audit": {"createdAt": "not-a-date"}}) == {
+            "audit": {"createdAt": "not-a-date"}
+        }
+
+    def test_many_indexes_errors_per_item(self):
+        schema = self.AuditSchema(many=True)
+        with pytest.raises(ValidationError) as excinfo:
+            schema.load(
+                [
+                    {"createdAt": "not-a-date"},
+                    {"extra": "ok"},
+                ]
+            )
+        assert excinfo.value.messages == {0: {"createdAt": ["Read-only field."]}}
+        assert excinfo.value.valid_data == [{}, {"extra": "ok"}]
+
+    def test_partial_does_not_bypass_policy(self):
+        class PartialSchema(Schema):
+            name = fields.String(required=True)
+            created_at = fields.DateTime(dump_only=True, data_key="createdAt")
+
+            class Meta:
+                unknown = INCLUDE
+                reject_dump_only = True
+
+        schema = PartialSchema()
+        with pytest.raises(ValidationError) as excinfo:
+            schema.load({"createdAt": "not-a-date"}, partial=True)
+        assert excinfo.value.messages == {"createdAt": ["Read-only field."]}
+
+    @pytest.mark.parametrize(
+        ("unknown", "expected_messages", "expected_valid_data"),
+        [
+            (INCLUDE, {}, {"createdAt": "not-a-date"}),
+            (EXCLUDE, {}, {}),
+            (RAISE, {"createdAt": ["Unknown field."]}, {}),
+        ],
+    )
+    def test_default_contract_is_unchanged_without_policy(
+        self, unknown, expected_messages, expected_valid_data
+    ):
+        schema = self.LenientAuditSchema(unknown=unknown)
+        if expected_messages:
+            with pytest.raises(ValidationError) as excinfo:
+                schema.load({"createdAt": "not-a-date"})
+            assert excinfo.value.messages == expected_messages
+            assert excinfo.value.valid_data == expected_valid_data
+        else:
+            assert schema.load({"createdAt": "not-a-date"}) == expected_valid_data

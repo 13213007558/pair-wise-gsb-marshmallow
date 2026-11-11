@@ -218,6 +218,7 @@ class SchemaOpts:
         self.load_only = getattr(meta, "load_only", ())
         self.dump_only = getattr(meta, "dump_only", ())
         self.unknown = getattr(meta, "unknown", RAISE)
+        self.reject_dump_only = getattr(meta, "reject_dump_only", False)
         self.register = getattr(meta, "register", True)
         self.many = getattr(meta, "many", False)
 
@@ -268,12 +269,21 @@ class Schema(metaclass=SchemaMeta):
         will be ignored. Use dot delimiters to specify nested fields.
     :param unknown: Whether to exclude, include, or raise an error for unknown
         fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
+    :param reject_dump_only: If `True`, input keys that correspond to
+        `dump_only` fields (matched by attribute name or `data_key`) are
+        rejected with a validation error instead of being treated as unknown
+        fields. This applies regardless of the `unknown` option, so that
+        read-only keys are never silently dropped (`EXCLUDE`) or passed
+        through into the deserialized result (`INCLUDE`). Defaults to `False`.
 
     .. versionchanged:: 3.0.0
         Remove ``prefix`` parameter.
 
     .. versionchanged:: 4.0.0
         Remove ``context`` parameter.
+
+    .. versionadded:: 4.5.0
+        Add ``reject_dump_only`` parameter.
     """
 
     TYPE_MAPPING: dict[type, type[Field]] = {
@@ -302,6 +312,7 @@ class Schema(metaclass=SchemaMeta):
     _default_error_messages: dict[str, str] = {
         "type": "Invalid input type.",
         "unknown": "Unknown field.",
+        "read_only": "Read-only field.",
     }
 
     OPTIONS_CLASS: type = SchemaOpts
@@ -398,6 +409,14 @@ class Schema(metaclass=SchemaMeta):
         """Whether to exclude, include, or raise an error for unknown fields in the data.
         Use `EXCLUDE`, `INCLUDE` or `RAISE`.
         """
+        reject_dump_only: typing.ClassVar[bool]
+        """If `True`, reject input keys that correspond to `dump_only` fields
+        (matched by attribute name or `data_key`) with a validation error,
+        regardless of the `unknown <marshmallow.Schema.Meta.unknown>` option.
+        Defaults to `False`.
+
+        .. versionadded:: 4.5.0
+        """
         register: typing.ClassVar[bool]
         """Whether to register the `Schema <marshmallow.Schema>` with marshmallow's internal
         class registry. Must be `True` if you intend to refer to this `Schema <marshmallow.Schema>`
@@ -415,6 +434,7 @@ class Schema(metaclass=SchemaMeta):
         dump_only: types.StrSequenceOrSet = (),
         partial: bool | types.StrSequenceOrSet | None = None,
         unknown: types.UnknownOption | None = None,
+        reject_dump_only: bool | None = None,
     ):
         # Raise error if only or exclude is passed as string, not list of strings
         if only is not None and not is_collection(only):
@@ -434,12 +454,31 @@ class Schema(metaclass=SchemaMeta):
         self.unknown: types.UnknownOption = (
             self.opts.unknown if unknown is None else unknown
         )
+        self.reject_dump_only: bool = (
+            self.opts.reject_dump_only
+            if reject_dump_only is None
+            else reject_dump_only
+        )
         self._normalize_nested_options()
         #: Dictionary mapping field_names -> :class:`Field` objects
         self.fields: dict[str, Field] = {}
         self.load_fields: dict[str, Field] = {}
         self.dump_fields: dict[str, Field] = {}
         self._init_fields()
+        #: Input keys (attribute names and `data_key` aliases) that map to
+        #: `dump_only` fields. Only populated when `reject_dump_only` is
+        #: enabled; otherwise empty so that unknown-field handling is
+        #: unchanged.
+        self._dump_only_input_keys: set[str] = (
+            {
+                key
+                for attr_name, field_obj in self.fields.items()
+                if field_obj.dump_only
+                for key in (attr_name, field_obj.data_key or attr_name)
+            }
+            if self.reject_dump_only
+            else set()
+        )
         messages = {}
         messages.update(self._default_error_messages)
         for cls in reversed(self.__class__.__mro__):
@@ -687,12 +726,19 @@ class Schema(metaclass=SchemaMeta):
                 if value is not missing:
                     key = field_obj.attribute or attr_name
                     set_value(ret_d, key, value)
+            if self._dump_only_input_keys:
+                for key in set(data) & self._dump_only_input_keys:
+                    error_store.store_error(
+                        [self.error_messages["read_only"]],
+                        key,
+                        index,
+                    )
             if unknown != EXCLUDE:
                 fields = {
                     field_obj.data_key if field_obj.data_key is not None else field_name
                     for field_name, field_obj in self.load_fields.items()
                 }
-                for key in set(data) - fields:
+                for key in set(data) - fields - self._dump_only_input_keys:
                     value = data[key]
                     if unknown == INCLUDE:
                         ret_d[key] = value
