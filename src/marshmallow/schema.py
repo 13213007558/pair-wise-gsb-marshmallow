@@ -644,6 +644,27 @@ class Schema(metaclass=SchemaMeta):
             error_store.store_error([self.error_messages["type"]], index=index)
         else:
             partial_is_collection = is_collection(partial)
+            # ``partial`` paths may be expressed with either the internal
+            # attribute name or the external ``data_key`` (including across
+            # nested schemas via dot delimiters). Normalize the first segment of
+            # every path to this schema's attribute names so that lookup,
+            # required-check bypassing and nested propagation share one
+            # contract. Paths that do not match a declared field are preserved
+            # unchanged so they keep propagating through nested schemas.
+            if partial_is_collection:
+                normalized_partial = self.set_class()
+                for path in partial:
+                    head, separator, tail = path.partition(".")
+                    if head not in self.load_fields:
+                        for candidate, candidate_field in self.load_fields.items():
+                            if candidate_field.data_key == head:
+                                head = candidate
+                                break
+                    if separator:
+                        normalized_partial.add(head + separator + tail)
+                    else:
+                        normalized_partial.add(head)
+                partial = normalized_partial
             for attr_name, field_obj in self.load_fields.items():
                 field_name = (
                     field_obj.data_key if field_obj.data_key is not None else attr_name

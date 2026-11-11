@@ -2332,7 +2332,7 @@ class TestValidation:
 
     def test_nested_partial_tuple_with_data_key(self):
         class AddressSchema(Schema):
-            zip_code = fields.String(required=True)
+            zip_code = fields.String(data_key="zipCode", required=True)
             city = fields.String(required=True)
 
         class PersonSchema(Schema):
@@ -2341,14 +2341,75 @@ class TestValidation:
             )
 
         data = {"homeAddress": {"city": "Springfield"}}
-        # partial uses attr_name ("address.zip_code"), not data_key
+        # partial accepts the internal attribute name ...
         result = PersonSchema().load(data, partial=("address.zip_code",))
         assert result["address"]["city"] == "Springfield"
         assert "zip_code" not in result["address"]
+        # ... and the external data_key, including across the nested boundary
+        result = PersonSchema().load(data, partial=("homeAddress.zipCode",))
+        assert result["address"]["city"] == "Springfield"
+        assert "zip_code" not in result["address"]
+        # Fields not named in partial still enforce required; error keys use
+        # the external data_key at every level.
+        with pytest.raises(ValidationError) as excinfo:
+            PersonSchema().load(data, partial=("homeAddress.city",))
+        assert "zipCode" in excinfo.value.messages["homeAddress"]
+        # Explicit null is a provided value and is not relaxed by partial.
+        with pytest.raises(ValidationError) as excinfo:
+            PersonSchema().load(
+                {"homeAddress": {"city": None, "zipCode": "12345"}},
+                partial=("homeAddress.city",),
+            )
+        assert excinfo.value.messages["homeAddress"]["city"] == [
+            "Field may not be null."
+        ]
         # Without partial, it should fail on the missing required field
         with pytest.raises(ValidationError) as excinfo:
             PersonSchema().load(data)
-        assert "zip_code" in excinfo.value.messages["homeAddress"]
+        assert "zipCode" in excinfo.value.messages["homeAddress"]
+
+    def test_nested_partial_tuple_with_data_key_many(self):
+        class CredentialSchema(Schema):
+            display_name = fields.String(data_key="displayName", required=True)
+            client_id = fields.String(data_key="clientId", required=True)
+            client_secret = fields.String(data_key="clientSecret", required=True)
+
+        class AccountSchema(Schema):
+            credentials = fields.Nested(
+                CredentialSchema, many=True, data_key="credentialList", required=True
+            )
+
+        payload = {
+            "credentialList": [
+                {"displayName": "rotated", "clientId": "id", "clientSecret": "shh"}
+            ]
+        }
+        # The aliased leaf path is accepted whether expressed with attribute
+        # names or external data_keys.
+        for partial in (
+            ("credentials.display_name",),
+            ("credentialList.displayName",),
+        ):
+            result = AccountSchema().load(payload, partial=partial)
+            assert result["credentials"][0]["display_name"] == "rotated"
+            # With the leaf omitted, partial relaxes only that leaf; the auth
+            # material stays required and error keys keep their data_key names.
+            with pytest.raises(ValidationError) as excinfo:
+                AccountSchema().load(
+                    {"credentialList": [{"displayName": "rotated"}]}, partial=partial
+                )
+            messages = excinfo.value.messages["credentialList"][0]
+            assert set(messages) == {"clientId", "clientSecret"}
+        # An explicit null on the partial field still raises the null error.
+        with pytest.raises(ValidationError) as excinfo:
+            AccountSchema().load(
+                {"credentialList": [{"displayName": None}]},
+                partial=("credentialList.displayName",),
+            )
+        assert (
+            excinfo.value.messages["credentialList"][0]["displayName"]
+            == ["Field may not be null."]
+        )
 
 
 @pytest.mark.parametrize("FieldClass", ALL_FIELDS)

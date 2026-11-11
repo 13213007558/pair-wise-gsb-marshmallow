@@ -168,6 +168,13 @@ You can specify a subset of the fields to allow partial loading using dot delimi
     pprint(result)
     # {'author': {'name': 'Monty'}, 'title': 'Something Completely Different'}
 
+Each segment of a dotted path may use either the field's attribute name or its
+``data_key``. This keeps ``partial`` consistent with the keys used in the input
+payload and in ``ValidationError.messages``. Only fields named in ``partial``
+may be missing; every other field still enforces ``required``. Note that
+``partial`` relaxes the missing-field check only: sending an explicit ``null``
+still raises a validation error unless the field has ``allow_none=True``.
+
 .. _two-way-nesting:
 
 Two-way nesting

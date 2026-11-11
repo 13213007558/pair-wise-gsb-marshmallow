@@ -3,6 +3,46 @@ Upgrading to newer releases
 
 This section documents migration paths to new releases.
 
+.. _upgrading_unreleased:
+
+Upgrading from 4.x (unreleased)
++++++++++++++++++++++++++++++++
+
+``partial`` paths accept ``data_key`` names
+*******************************************
+
+String paths passed to ``Schema.load(..., partial=...)`` (or to a schema's
+``partial`` argument) were previously matched against internal attribute names
+only, even though input payloads and validation error keys use the external
+``data_key``. Each segment of a dotted path may now be given using either the
+attribute name or the ``data_key``; the two are equivalent.
+
+.. code-block:: python
+
+    class AddressSchema(Schema):
+        zip_code = fields.String(data_key="zipCode", required=True)
+
+    class PersonSchema(Schema):
+        address = fields.Nested(AddressSchema, data_key="homeAddress")
+
+    data = {"homeAddress": {"city": "Springfield"}}
+    # These are now equivalent; previously only the first form worked.
+    PersonSchema().load(data, partial=("address.zip_code",))
+    PersonSchema().load(data, partial=("homeAddress.zipCode",))
+
+Migration notes for existing callers:
+
+- No change is required: attribute-name paths keep working exactly as before.
+- Prefer the ``data_key`` form in new code because it matches the keys clients
+  send and the keys returned in ``ValidationError.messages``.
+- ``partial`` only relaxes the *missing required field* check. An explicit
+  ``null`` still raises the ``null`` validation error unless ``allow_none`` is
+  set, regardless of ``partial``.
+- Fields not listed in ``partial`` keep enforcing ``required``; ``partial=True``
+  still allows every field to be missing.
+- Paths that do not correspond to a declared field are ignored for matching and
+  never silently relax a real required field.
+
 .. _upgrading_4_0:
 
 Upgrading to 4.0
