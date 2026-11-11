@@ -9,6 +9,7 @@ from marshmallow.decorators import (
 )
 from marshmallow.exceptions import ValidationError
 from marshmallow.schema import Schema, SchemaOpts
+from marshmallow.utils import SnapshotError
 
 from . import fields
 
@@ -18,6 +19,7 @@ __all__ = [
     "RAISE",
     "Schema",
     "SchemaOpts",
+    "SnapshotError",
     "ValidationError",
     "fields",
     "missing",

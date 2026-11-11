@@ -1,6 +1,23 @@
 Changelog
 =========
 
+4.5.0 (unreleased)
+------------------
+
+Features:
+
+- Add opt-in ``snapshot_original`` mode to `Schema <marshmallow.Schema>`
+  (constructor argument and ``class Meta`` option). When enabled, `load
+  <marshmallow.Schema.load>` and `validate <marshmallow.Schema.validate>` take
+  a deep snapshot of the raw input before any
+  `pre_load <marshmallow.decorators.pre_load>` hook runs, so data exposed via
+  ``pass_original=True``, `handle_error <marshmallow.Schema.handle_error>` and
+  the raised `ValidationError <marshmallow.exceptions.ValidationError>` is
+  unaffected by in-place hook mutations. Only JSON-compatible data is
+  supported; unsupported or cyclic input raises
+  `SnapshotError <marshmallow.utils.SnapshotError>`. The default
+  reference-passing behavior is unchanged.
+
 4.4.0 (2026-11-03)
 ------------------
 

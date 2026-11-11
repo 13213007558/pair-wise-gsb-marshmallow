@@ -159,3 +159,63 @@ def timedelta_to_microseconds(value: dt.timedelta) -> int:
     https://github.com/python/cpython/blob/v3.13.1/Lib/_pydatetime.py#L805-L807
     """
     return (value.days * (24 * 3600) + value.seconds) * 1000000 + value.microseconds
+
+
+# JSON-compatible leaf types. ``tuple`` containers are also accepted for input
+# convenience (``json.loads`` never produces tuples, but Python callers pass
+# them); snapshots preserve them as tuples.
+_JSON_SCALAR_TYPES = (str, int, float, bool, type(None))
+
+
+class SnapshotError(ValueError):
+    """Raised when ``snapshot_original`` cannot snapshot the input.
+
+    See :func:`snapshot_json_compatible` for the supported input types.
+    """
+
+
+def snapshot_json_compatible(value: typing.Any) -> typing.Any:
+    """Return a deep, independent snapshot of JSON-compatible ``value``.
+
+    The snapshot is built by reconstructing plain ``dict``, ``list`` and
+    ``tuple`` containers instead of calling ``copy``/``deepcopy`` or any
+    user-defined copy protocol, so taking a snapshot never triggers side
+    effects on custom objects. Supported leaf values are ``str``, ``int``,
+    ``float`` (including ``NaN``/infinity), ``bool`` and ``None``.
+
+    :raises SnapshotError: if ``value`` (or a nested item) is not a supported
+        type or if a container references itself. The error is raised before
+        any schema hook runs, so no partially built snapshot is observable.
+
+    .. versionadded:: 4.5.0
+    """
+
+    def _snapshot(node: typing.Any) -> typing.Any:
+        if isinstance(node, _JSON_SCALAR_TYPES):
+            return node
+        if isinstance(node, dict):
+            node_id = id(node)
+            if node_id in seen:
+                raise SnapshotError("Cannot snapshot data that contains a cycle.")
+            seen.add(node_id)
+            try:
+                return {key: _snapshot(item) for key, item in node.items()}
+            finally:
+                seen.remove(node_id)
+        if isinstance(node, (list, tuple)):
+            node_id = id(node)
+            if node_id in seen:
+                raise SnapshotError("Cannot snapshot data that contains a cycle.")
+            seen.add(node_id)
+            try:
+                snapshot = [_snapshot(item) for item in node]
+            finally:
+                seen.remove(node_id)
+            return tuple(snapshot) if isinstance(node, tuple) else snapshot
+        raise SnapshotError(
+            "snapshot_original only supports JSON-compatible input "
+            f"(dict, list, tuple, str, int, float, bool, None), got {type(node).__name__}."
+        )
+
+    seen: set[int] = set()
+    return _snapshot(value)

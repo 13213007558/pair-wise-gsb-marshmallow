@@ -110,6 +110,11 @@ def validates_schema(
     If ``pass_original=True``, the original data (before unmarshalling) will be passed as
     an additional argument to the method.
 
+    By default this is the exact object handed to `Schema.load <marshmallow.Schema.load>`,
+    so an `pre_load` hook that mutates that object in place changes what is seen here.
+    Enable ``snapshot_original`` on the schema to receive an independent deep snapshot
+    captured before any ``pre_load`` hook ran instead.
+
     If ``skip_on_field_errors=True``, this validation method will be skipped whenever
     validation errors have been detected when validating fields.
 
@@ -208,6 +213,11 @@ def post_load(
 
     If ``pass_original=True``, the original data (before deserializing) will be passed as
     an additional argument to the method.
+
+    By default this is the exact object handed to `Schema.load <marshmallow.Schema.load>`,
+    so an `pre_load` hook that mutates that object in place changes what is seen here.
+    Enable ``snapshot_original`` on the schema to receive an independent deep snapshot
+    captured before any ``pre_load`` hook ran instead.
 
     .. versionchanged:: 3.0.0 ``partial`` and ``many`` are always passed as keyword arguments to
         the decorated method.

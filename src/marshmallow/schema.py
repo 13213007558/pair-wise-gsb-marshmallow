@@ -37,6 +37,7 @@ from marshmallow.utils import (
     is_collection,
     is_sequence_but_not_string,
     set_value,
+    snapshot_json_compatible,
 )
 
 if typing.TYPE_CHECKING:
@@ -220,6 +221,7 @@ class SchemaOpts:
         self.unknown = getattr(meta, "unknown", RAISE)
         self.register = getattr(meta, "register", True)
         self.many = getattr(meta, "many", False)
+        self.snapshot_original = getattr(meta, "snapshot_original", False)
 
 
 class Schema(metaclass=SchemaMeta):
@@ -268,6 +270,12 @@ class Schema(metaclass=SchemaMeta):
         will be ignored. Use dot delimiters to specify nested fields.
     :param unknown: Whether to exclude, include, or raise an error for unknown
         fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
+    :param snapshot_original: If `True`, snapshot the raw input of `load` and
+        `validate` before `pre_load` hooks run, so data exposed via
+        ``pass_original=True``, `handle_error` and `ValidationError` is never
+        affected by in-place hook mutations. Only supports JSON-compatible
+        input. If `None`, the ``snapshot_original`` `class Meta` option is used
+        (default `False`, the historical reference-passing behavior).
 
     .. versionchanged:: 3.0.0
         Remove ``prefix`` parameter.
@@ -404,6 +412,18 @@ class Schema(metaclass=SchemaMeta):
         by class name in `Nested` fields. Only set this to `False` when memory
         usage is critical. Defaults to `True`.
         """
+        snapshot_original: typing.ClassVar[bool]
+        """Whether to snapshot the raw input of `load <marshmallow.Schema.load>`
+        (and `validate <marshmallow.Schema.validate>`) before any `pre_load
+        <marshmallow.decorators.pre_load>` hook runs. When `True`, data passed
+        through ``pass_original=True`` and to `handle_error
+        <marshmallow.Schema.handle_error>` / the raised
+        `ValidationError <marshmallow.exceptions.ValidationError>` is an
+        independent deep copy of the data the caller actually provided, so
+        in-place normalization in ``pre_load`` cannot alter the audit trail.
+        Only JSON-compatible data is supported. Defaults to `False`, which keeps
+        the historical reference-passing behavior.
+        """
 
     def __init__(
         self,
@@ -415,6 +435,7 @@ class Schema(metaclass=SchemaMeta):
         dump_only: types.StrSequenceOrSet = (),
         partial: bool | types.StrSequenceOrSet | None = None,
         unknown: types.UnknownOption | None = None,
+        snapshot_original: bool | None = None,
     ):
         # Raise error if only or exclude is passed as string, not list of strings
         if only is not None and not is_collection(only):
@@ -433,6 +454,11 @@ class Schema(metaclass=SchemaMeta):
         self.partial = partial
         self.unknown: types.UnknownOption = (
             self.opts.unknown if unknown is None else unknown
+        )
+        self.snapshot_original: bool = (
+            self.opts.snapshot_original
+            if snapshot_original is None
+            else snapshot_original
         )
         self._normalize_nested_options()
         #: Dictionary mapping field_names -> :class:`Field` objects
@@ -730,6 +756,12 @@ class Schema(metaclass=SchemaMeta):
             This method returns the deserialized data rather than a ``(data, errors)`` tuple.
             A :exc:`ValidationError <marshmallow.exceptions.ValidationError>` is raised
             if invalid data are passed.
+        .. versionchanged:: 4.5.0
+            With ``snapshot_original=True`` (constructor or `class Meta
+            <marshmallow.Schema.Meta>`), the data passed through
+            ``pass_original`` hooks, `handle_error` and the raised
+            :exc:`ValidationError <marshmallow.exceptions.ValidationError>` is a
+            deep snapshot taken before the first `pre_load` hook.
         """
         return self._do_load(
             data, many=many, partial=partial, unknown=unknown, postprocess=True
@@ -870,6 +902,13 @@ class Schema(metaclass=SchemaMeta):
         unknown = self.unknown if unknown is None else unknown
         if partial is None:
             partial = self.partial
+        # Snapshot the raw input before any hook can mutate it in place.
+        # ``original_data`` is the object later exposed via pass_original,
+        # handle_error and ValidationError. Without snapshotting it is the
+        # caller's own object; with snapshotting it is an independent deep copy.
+        original_data = (
+            snapshot_json_compatible(data) if self.snapshot_original else data
+        )
         # Run preprocessors
         if self._hooks[PRE_LOAD]:
             try:
@@ -877,7 +916,7 @@ class Schema(metaclass=SchemaMeta):
                     PRE_LOAD,
                     data,
                     many=many,
-                    original_data=data,
+                    original_data=original_data,
                     partial=partial,
                     unknown=unknown,
                 )
@@ -906,7 +945,7 @@ class Schema(metaclass=SchemaMeta):
                     error_store=error_store,
                     pass_collection=True,
                     data=result,
-                    original_data=data,
+                    original_data=original_data,
                     many=many,
                     partial=partial,
                     unknown=unknown,
@@ -916,7 +955,7 @@ class Schema(metaclass=SchemaMeta):
                     error_store=error_store,
                     pass_collection=False,
                     data=result,
-                    original_data=data,
+                    original_data=original_data,
                     many=many,
                     partial=partial,
                     unknown=unknown,
@@ -930,15 +969,15 @@ class Schema(metaclass=SchemaMeta):
                         POST_LOAD,
                         result,
                         many=many,
-                        original_data=data,
+                        original_data=original_data,
                         partial=partial,
                         unknown=unknown,
                     )
                 except ValidationError as err:
                     errors = err.normalized_messages()
         if errors:
-            exc = ValidationError(errors, data=data, valid_data=result)
-            self.handle_error(exc, data, many=many, partial=partial)
+            exc = ValidationError(errors, data=original_data, valid_data=result)
+            self.handle_error(exc, original_data, many=many, partial=partial)
             raise exc
 
         return result

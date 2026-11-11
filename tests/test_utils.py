@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import datetime as dt
 from copy import copy, deepcopy
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import pytest
-
 from marshmallow import Schema, fields, utils
 
 
@@ -148,3 +147,95 @@ def test_function_field_using_type_annotation():
     data = {"friends": "Clark;Alfred;Robin"}
     result = MySchema().load(data)
     assert result == {"friends": ["Clark", "Alfred", "Robin"]}
+
+
+class TestSnapshotJsonCompatible:
+    def test_scalars_passed_through(self):
+        for value in (None, True, False, 1, 1.5, "text"):
+            assert utils.snapshot_json_compatible(value) == value
+
+    def test_containers_are_rebuilt_and_independent(self):
+        original: dict[str, Any] = {"a": [1, {"b": 2}], "c": (3, [4])}
+        snapshot = utils.snapshot_json_compatible(original)
+
+        assert snapshot == original
+        assert snapshot is not original
+        assert snapshot["a"] is not original["a"]
+        assert snapshot["a"][1] is not original["a"][1]
+        assert isinstance(snapshot["c"], tuple)
+        assert snapshot["c"][1] is not original["c"][1]
+
+        original["a"].append(3)
+        assert snapshot["a"] == [1, {"b": 2}]
+
+    def test_repeated_references_are_duplicated_not_shared(self):
+        shared = {"x": 1}
+        snapshot = utils.snapshot_json_compatible([shared, shared])
+
+        assert snapshot == [{"x": 1}, {"x": 1}]
+        assert snapshot[0] is not snapshot[1]
+        assert snapshot[0] is not shared
+
+    def test_dict_subclass_is_rebuilt_as_plain_dict(self):
+        class MyDict(dict):
+            pass
+
+        snapshot = utils.snapshot_json_compatible(MyDict(a=1))
+        assert type(snapshot) is dict
+        assert snapshot == {"a": 1}
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            object(),
+            {1, 2},
+            dt.date(2020, 1, 1),
+            b"bytes",
+        ],
+    )
+    def test_unsupported_types_raise_snapshot_error(self, value):
+        with pytest.raises(utils.SnapshotError):
+            utils.snapshot_json_compatible(value)
+
+    def test_nested_unsupported_type_raises_snapshot_error(self):
+        with pytest.raises(utils.SnapshotError, match="date"):
+            utils.snapshot_json_compatible({"a": [dt.date(2020, 1, 1)]})
+
+    def test_self_referential_dict_raises(self):
+        cyclic: dict = {"a": 1}
+        cyclic["self"] = cyclic
+        with pytest.raises(utils.SnapshotError, match="cycle"):
+            utils.snapshot_json_compatible(cyclic)
+
+    def test_self_referential_list_raises(self):
+        cyclic: list = [1]
+        cyclic.append(cyclic)
+        with pytest.raises(utils.SnapshotError, match="cycle"):
+            utils.snapshot_json_compatible(cyclic)
+
+    def test_shared_non_cyclic_reference_is_allowed(self):
+        shared = {"x": 1}
+        snapshot = utils.snapshot_json_compatible({"a": shared, "b": shared})
+        assert snapshot == {"a": {"x": 1}, "b": {"x": 1}}
+
+    def test_no_copy_protocol_invoked(self):
+        class EvilDict(dict):
+            def __deepcopy__(self, memo):
+                raise AssertionError
+
+            def __copy__(self):
+                raise AssertionError
+
+        class EvilList(list):
+            def __deepcopy__(self, memo):
+                raise AssertionError
+
+            def __copy__(self):
+                raise AssertionError
+
+        snapshot = utils.snapshot_json_compatible(
+            EvilDict(items=EvilList([1, EvilDict(x=2)]))
+        )
+        assert type(snapshot) is dict
+        assert type(snapshot["items"]) is list
+        assert type(snapshot["items"][1]) is dict
